@@ -538,7 +538,12 @@ impl ComposioTool {
 
         if body.items.is_empty() {
             anyhow::bail!(
-                "No auth config found for toolkit '{app_name}'. Create one in Composio first."
+                "No authentication configuration found for app '{app_name}'. \
+                 \nTo fix this:\
+                 \n1. Visit https://app.composio.dev/apps and search for '{app_name}'\
+                 \n2. Click 'Add Integration' or 'Configure' for {app_name}\
+                 \n3. Follow the setup wizard to create an auth config\
+                 \n4. Once created, retry action='connect' with app='{app_name}'"
             );
         }
 
@@ -560,11 +565,38 @@ impl Tool for ComposioTool {
     }
 
     fn description(&self) -> &str {
-        "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). \
-         Use action='list' to see available actions, \
-         action='list_accounts' or action='connected_accounts' to list OAuth-connected accounts after login, \
-         action='execute' with action_name/tool_slug and params (connected_account_id auto-resolved when omitted), \
-         or action='connect' with app/auth_config_id to get OAuth URL."
+        "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, Dropbox, etc.). \
+         \n\n🔄 RECOMMENDED WORKFLOW (3 steps):\
+         \n\n1️⃣ SEARCH TOOLS (Discovery Phase)\
+         \n   action='list' with app='dropbox'\
+         \n   → Discovers available actions for the app\
+         \n   → Shows connection status (CONNECTED/DISCONNECTED)\
+         \n   → Lists tool capabilities and known pitfalls\
+         \n\n2️⃣ MANAGE CONNECTIONS (Authentication Phase)\
+         \n   If status shows DISCONNECTED:\
+         \n   action='connect' with app='dropbox'\
+         \n   → Generates OAuth URL (expires in 10 minutes)\
+         \n   → User must visit URL to authorize\
+         \n   → Returns connection status and connected_account_id\
+         \n   \
+         \n   Then verify connection:\
+         \n   action='list_accounts' (or 'connected_accounts') with app='dropbox'\
+         \n   → Shows ACTIVE connections with connected_account_id\
+         \n   → Confirms authentication is complete\
+         \n\n3️⃣ EXECUTE ACTIONS (Operation Phase)\
+         \n   action='execute' with action_name='DROPBOX_GET_ABOUT_ME' and params={}\
+         \n   → Executes the tool action\
+         \n   → connected_account_id is auto-resolved if only one exists\
+         \n   → For multiple accounts, specify connected_account_id explicitly\
+         \n\n📋 AVAILABLE ACTIONS:\
+         \n• action='list' [app='gmail'] - Search and discover tools\
+         \n• action='connect' app='dropbox' - Initiate OAuth connection\
+         \n• action='list_accounts' [app='dropbox'] - Verify active connections (alias: connected_accounts)\
+         \n• action='execute' action_name='TOOL_NAME' params={} - Run tool action\
+         \n\n⚠️ TROUBLESHOOTING:\
+         \n• If connect fails: App may need configuration in Composio dashboard (https://app.composio.dev/apps)\
+         \n• If execute fails with 401/403: Re-authorize (connection expired/revoked)\
+         \n• Connection links expire in 10 minutes - generate new link if expired"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -623,30 +655,76 @@ impl Tool for ComposioTool {
         match action {
             "list" => {
                 let app = args.get("app").and_then(|v| v.as_str());
+
+                // Check connection status if app is specified
+                let connection_status = if let Some(app_name) = app {
+                    match self.list_connected_accounts(Some(app_name), Some(entity_id)).await {
+                        Ok(accounts) if !accounts.is_empty() => {
+                            let active_count = accounts.iter().filter(|a| a.status == "ACTIVE").count();
+                            if active_count > 0 {
+                                format!("✓ CONNECTED ({} active account{})", active_count, if active_count == 1 { "" } else { "s" })
+                            } else {
+                                "⚠ DISCONNECTED (accounts exist but not active)".to_string()
+                            }
+                        }
+                        _ => "✗ DISCONNECTED (no accounts found)".to_string(),
+                    }
+                } else {
+                    String::new()
+                };
+
                 match self.list_actions(app).await {
                     Ok(actions) => {
+                        let mut output = String::new();
+
+                        // Show connection status header if app is specified
+                        if let Some(app_name) = app {
+                            let _ = writeln!(output, "🔍 USE CASE: {}", app_name.to_uppercase());
+                            let _ = writeln!(output, "📊 STATUS: {}\n", connection_status);
+                        }
+
                         let summary: Vec<String> = actions
                             .iter()
                             .take(20)
                             .map(|a| {
                                 format!(
-                                    "- {} ({}): {}",
+                                    "• {} ({})\n  Description: {}\n  Known Pitfalls: {}",
                                     a.name,
                                     a.app_name.as_deref().unwrap_or("?"),
-                                    a.description.as_deref().unwrap_or("")
+                                    a.description.as_deref().unwrap_or("No description available"),
+                                    "401/403 typically indicates expired/revoked auth or missing scopes"
                                 )
                             })
                             .collect();
+
                         let total = actions.len();
-                        let output = format!(
-                            "Found {total} available actions:\n{}{}",
-                            summary.join("\n"),
+                        let _ = write!(
+                            output,
+                            "Found {} available action{}:\n\n{}{}",
+                            total,
+                            if total == 1 { "" } else { "s" },
+                            summary.join("\n\n"),
                             if total > 20 {
-                                format!("\n... and {} more", total - 20)
+                                format!("\n\n... and {} more actions available", total - 20)
                             } else {
                                 String::new()
                             }
                         );
+
+                        // Add next steps guidance
+                        if connection_status.contains("DISCONNECTED") {
+                            let _ = write!(
+                                output,
+                                "\n\n⚡ NEXT STEP: Use action='connect' with app='{}' to authenticate",
+                                app.unwrap_or("appname")
+                            );
+                        } else if connection_status.contains("CONNECTED") {
+                            let _ = write!(
+                                output,
+                                "\n\n✅ Ready to execute! Use action='execute' with action_name='TOOL_NAME' and params={{}}"
+                            );
+                        }
+
                         Ok(ToolResult {
                             success: true,
                             output,
@@ -673,30 +751,68 @@ impl Tool for ComposioTool {
                             return Ok(ToolResult {
                                 success: true,
                                 output: format!(
-                                    "No connected accounts found{app_hint} for entity '{entity_id}'. Run action='connect' first."
+                                    "⚠ No connected accounts found{app_hint} for entity '{entity_id}'.\
+                                     \n\n⚡ NEXT STEP: Use action='connect' with app='appname' to authenticate"
                                 ),
                                 error: None,
                             });
                         }
+
+                        let mut output = String::new();
+                        let active_accounts: Vec<_> = accounts.iter().filter(|a| a.status == "ACTIVE").collect();
+                        let total = accounts.len();
+                        let active_count = active_accounts.len();
+
+                        let _ = writeln!(
+                            output,
+                            "📊 Connection Status for entity '{entity_id}':\
+                             \n   Total: {} account{}\
+                             \n   Active: {} account{}\n",
+                            total,
+                            if total == 1 { "" } else { "s" },
+                            active_count,
+                            if active_count == 1 { "" } else { "s" }
+                        );
 
                         let summary: Vec<String> = accounts
                             .iter()
                             .take(20)
                             .map(|account| {
                                 let toolkit = account.toolkit_slug().unwrap_or("?");
-                                format!("- {} [{}] toolkit={toolkit}", account.id, account.status)
+                                let status_icon = if account.status == "ACTIVE" { "✓" } else { "⚠" };
+                                format!(
+                                    "{} {} [{}]\n  Toolkit: {}\n  ID: {}",
+                                    status_icon,
+                                    toolkit.to_uppercase(),
+                                    account.status,
+                                    toolkit,
+                                    account.id
+                                )
                             })
                             .collect();
-                        let total = accounts.len();
-                        let output = format!(
-                            "Found {total} connected accounts (entity '{entity_id}'):\n{}{}\nUse connected_account_id in action='execute' when needed.",
-                            summary.join("\n"),
-                            if total > 20 {
-                                format!("\n... and {} more", total - 20)
-                            } else {
-                                String::new()
-                            }
-                        );
+
+                        let _ = write!(output, "{}", summary.join("\n\n"));
+
+                        if total > 20 {
+                            let _ = write!(output, "\n\n... and {} more accounts", total - 20);
+                        }
+
+                        if active_count > 0 {
+                            let _ = write!(
+                                output,
+                                "\n\n✅ Ready to execute! Use action='execute' with:\
+                                 \n   • action_name='TOOL_NAME'\
+                                 \n   • params={{}}\
+                                 \n   • connected_account_id='{}' (optional, auto-resolved if only one)",
+                                active_accounts[0].id
+                            );
+                        } else {
+                            let _ = write!(
+                                output,
+                                "\n\n⚠ No active connections. Use action='connect' to re-authenticate."
+                            );
+                        }
+
                         Ok(ToolResult {
                             success: true,
                             output,
@@ -783,14 +899,24 @@ impl Tool for ComposioTool {
                         let target =
                             app.unwrap_or(auth_config_id.unwrap_or("provided auth config"));
                         let mut output = format!(
-                            "Open this URL to connect {target}:\n{}",
+                            "🔗 {}: initiated\
+                             \n\n⚡ Action Required: Connect {target} ↗\
+                             \n\n🌐 Open this URL in your browser:\
+                             \n   {}\
+                             \n\n⏱ Link expires in 10 minutes\
+                             \n\n📋 Next steps:\
+                             \n1. Complete the authorization in your browser\
+                             \n2. Use action='list_accounts' with app='{target}' to verify connection\
+                             \n3. Look for status='ACTIVE' and note the connected_account_id\
+                             \n4. Use action='execute' to perform actions",
+                            target.to_uppercase(),
                             link.redirect_url
                         );
                         if let Some(connected_account_id) = link.connected_account_id.as_deref() {
                             if let Some(app_name) = app {
                                 self.cache_connected_account(app_name, entity_id, connected_account_id);
                             }
-                            let _ = write!(output, "\nConnected account ID: {connected_account_id}");
+                            let _ = write!(output, "\n\n✓ Connected account ID: {connected_account_id}");
                         }
                         Ok(ToolResult {
                             success: true,
@@ -798,11 +924,25 @@ impl Tool for ComposioTool {
                             error: None,
                         })
                     }
-                    Err(e) => Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Failed to get connection URL: {e}")),
-                    }),
+                    Err(e) => {
+                        let error_msg = format!("{e}");
+                        let enhanced_error = if error_msg.contains("No authentication configuration") {
+                            error_msg
+                        } else {
+                            format!(
+                                "Failed to generate connection link: {e}\
+                                 \n\nTroubleshooting:\
+                                 \n- Verify the app name is correct (e.g., 'dropbox', 'gmail', 'github')\
+                                 \n- Check that you have configured this app in Composio dashboard\
+                                 \n- Visit https://app.composio.dev/apps to set up integrations"
+                            )
+                        };
+                        Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(enhanced_error),
+                        })
+                    }
                 }
             }
 

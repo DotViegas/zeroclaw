@@ -841,6 +841,51 @@ pub struct ComposioConfig {
     /// Default entity ID for multi-user setups
     #[serde(default = "default_entity_id")]
     pub entity_id: String,
+    /// MCP (Model Context Protocol) integration configuration
+    #[serde(default)]
+    pub mcp: ComposioMcpConfig,
+}
+
+/// Composio MCP integration configuration (`[composio.mcp]` section).
+///
+/// Enables seamless access to Composio tools via MCP protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ComposioMcpConfig {
+    /// Enable MCP integration (auto-configured during onboard)
+    #[serde(default)]
+    pub enabled: bool,
+    /// MCP server ID (created during onboard or via Composio dashboard)
+    #[serde(default)]
+    pub server_id: Option<String>,
+    /// User ID for MCP instance (defaults to composio.entity_id)
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// Optional separate API key for MCP (if different from composio.api_key)
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Toolkits enabled in MCP server (e.g., ["gmail", "dropbox", "github"])
+    #[serde(default)]
+    pub toolkits: Vec<String>,
+    /// Auth config IDs per toolkit (for reference)
+    #[serde(default)]
+    pub auth_configs: std::collections::HashMap<String, String>,
+    /// Generated MCP URL (cached for performance)
+    #[serde(default)]
+    pub mcp_url: Option<String>,
+}
+
+impl Default for ComposioMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_id: None,
+            user_id: None,
+            api_key: None,
+            toolkits: Vec::new(),
+            auth_configs: std::collections::HashMap::new(),
+            mcp_url: None,
+        }
+    }
 }
 
 fn default_entity_id() -> String {
@@ -853,6 +898,7 @@ impl Default for ComposioConfig {
             enabled: false,
             api_key: None,
             entity_id: default_entity_id(),
+            mcp: ComposioMcpConfig::default(),
         }
     }
 }
@@ -5634,6 +5680,7 @@ default_temperature = 0.7
             enabled: true,
             api_key: Some("comp-key-123".into()),
             entity_id: "user42".into(),
+            mcp: ComposioMcpConfig::default(),
         };
         let toml_str = toml::to_string(&c).unwrap();
         let parsed: ComposioConfig = toml::from_str(&toml_str).unwrap();

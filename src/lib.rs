@@ -54,6 +54,7 @@ pub(crate) mod heartbeat;
 pub mod hooks;
 pub(crate) mod identity;
 pub(crate) mod integrations;
+pub mod mcp;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;
@@ -71,6 +72,9 @@ pub(crate) mod tunnel;
 pub(crate) mod util;
 
 pub use config::Config;
+
+// Re-export MCP types for easier access from other modules
+pub use mcp::{ComposioMcpClient, McpTool};
 
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

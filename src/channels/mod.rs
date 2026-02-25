@@ -2164,7 +2164,15 @@ fn load_openclaw_bootstrap_files(
         "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
     );
 
-    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
+    let bootstrap_files = [
+        "AGENTS.md",
+        "COMPOSIO.md",
+        "COMPOSIO_ORCHESTRATION.md",
+        "SOUL.md",
+        "TOOLS.md",
+        "IDENTITY.md",
+        "USER.md",
+    ];
 
     for filename in &bootstrap_files {
         inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
@@ -3045,20 +3053,23 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &workspace,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    ));
+    let tools_registry = Arc::new(
+        tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            runtime,
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &workspace,
+            &config.agents,
+            config.api_key.as_deref(),
+            &config,
+        )
+        .await,
+    );
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
 
@@ -3308,6 +3319,16 @@ mod tests {
         std::fs::write(
             tmp.path().join("AGENTS.md"),
             "# Agents\nFollow instructions.",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("COMPOSIO.md"),
+            "# Composio\nUse for cloud apps.",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("COMPOSIO_ORCHESTRATION.md"),
+            "# Composio Orchestration\nFollow the workflow.",
         )
         .unwrap();
         std::fs::write(tmp.path().join("TOOLS.md"), "# Tools\nUse shell carefully.").unwrap();
@@ -5290,6 +5311,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         assert!(prompt.contains("### USER.md"), "missing USER.md");
         assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
+        assert!(prompt.contains("### COMPOSIO.md"), "missing COMPOSIO.md");
         assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");
         // HEARTBEAT.md is intentionally excluded from channel prompts — it's only
         // relevant to the heartbeat worker and causes LLMs to emit spurious
@@ -5310,6 +5332,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(prompt.contains("[File not found: SOUL.md]"));
         assert!(prompt.contains("[File not found: AGENTS.md]"));
+        assert!(prompt.contains("[File not found: COMPOSIO.md]"));
         assert!(prompt.contains("[File not found: IDENTITY.md]"));
     }
 

@@ -99,6 +99,8 @@ impl PromptSection for IdentitySection {
         }
         for file in [
             "AGENTS.md",
+            "COMPOSIO.md",
+            "COMPOSIO_ORCHESTRATION.md",
             "SOUL.md",
             "TOOLS.md",
             "IDENTITY.md",

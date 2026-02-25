@@ -19,6 +19,7 @@ pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
 pub mod composio;
+pub mod composio_mcp;
 pub mod content_search;
 pub mod cron_add;
 pub mod cron_list;
@@ -54,6 +55,7 @@ pub mod web_search_tool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
+pub use composio_mcp::ComposioMcpTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
@@ -91,6 +93,7 @@ pub use web_search_tool::WebSearchTool;
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
+use crate::mcp::{ComposioMcpClient, McpTool};
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -151,9 +154,85 @@ pub fn default_tools_with_runtime(
     ]
 }
 
+/// Load Composio MCP tools dynamically from the MCP server
+///
+/// This function creates a Composio MCP client and fetches all available tools
+/// from the configured MCP server, wrapping them as native ZeroClaw tools.
+///
+/// # Arguments
+/// * `mcp_config` - MCP configuration from config.toml
+/// * `api_key` - Composio API key for authentication
+/// * `entity_id_fallback` - Fallback entity ID if user_id not set in MCP config
+/// * `security` - Security policy for access control
+///
+/// # Returns
+/// Vector of Arc-wrapped tools ready to be added to the tool registry
+pub async fn load_composio_mcp_tools(
+    mcp_config: &crate::config::ComposioMcpConfig,
+    api_key: &str,
+    entity_id_fallback: &str,
+    security: Arc<SecurityPolicy>,
+) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
+    if !mcp_config.enabled {
+        return Ok(Vec::new());
+    }
+
+    let server_id = mcp_config
+        .server_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("MCP server_id not configured"))?;
+
+    // Use MCP-specific API key if provided, otherwise fall back to main Composio API key
+    let mcp_api_key = mcp_config
+        .api_key
+        .as_deref()
+        .unwrap_or(api_key);
+
+    // Use user_id from MCP config, or fall back to entity_id
+    let user_id = mcp_config
+        .user_id
+        .as_deref()
+        .unwrap_or(entity_id_fallback);
+
+    // Create MCP client
+    let client = Arc::new(ComposioMcpClient::new(
+        mcp_api_key.to_string(),
+        server_id.clone(),
+        user_id.to_string(),
+    ));
+
+    // Fetch available tools from MCP server
+    let mcp_tools: Vec<McpTool> = client.list_tools().await?;
+
+    if mcp_tools.is_empty() {
+        eprintln!("Warning: Composio MCP server returned no tools. Check your MCP configuration.");
+        return Ok(Vec::new());
+    }
+
+    eprintln!(
+        "Info: Loaded {} tools from Composio MCP server ({})",
+        mcp_tools.len(),
+        server_id
+    );
+
+    // Convert to ZeroClaw tools
+    let tools: Vec<Arc<dyn Tool>> = mcp_tools
+        .into_iter()
+        .map(|mcp_tool| {
+            Arc::new(ComposioMcpTool::new(
+                client.clone(),
+                mcp_tool,
+                security.clone(),
+            )) as Arc<dyn Tool>
+        })
+        .collect();
+
+    Ok(tools)
+}
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
-pub fn all_tools(
+pub async fn all_tools(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
     memory: Arc<dyn Memory>,
@@ -180,11 +259,12 @@ pub fn all_tools(
         fallback_api_key,
         root_config,
     )
+    .await
 }
 
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
-pub fn all_tools_with_runtime(
+pub async fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
@@ -323,6 +403,34 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(delegate_tool));
     }
 
+    // Load Composio MCP tools if configured
+    if let Some(key) = composio_key {
+        if !key.is_empty() && root_config.composio.mcp.enabled {
+            match load_composio_mcp_tools(
+                &root_config.composio.mcp,
+                key,
+                composio_entity_id.unwrap_or(&root_config.composio.entity_id),
+                security.clone(),
+            )
+            .await
+            {
+                Ok(mcp_tools) => {
+                    if !mcp_tools.is_empty() {
+                        eprintln!(
+                            "✓ Loaded {} Composio MCP tools",
+                            mcp_tools.len()
+                        );
+                        tool_arcs.extend(mcp_tools);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("⚠ Failed to load Composio MCP tools: {}", e);
+                    eprintln!("  Continuing with direct Composio tool only.");
+                }
+            }
+        }
+    }
+
     boxed_registry_from_arcs(tool_arcs)
 }
 
@@ -347,8 +455,8 @@ mod tests {
         assert_eq!(tools.len(), 6);
     }
 
-    #[test]
-    fn all_tools_excludes_browser_when_disabled() {
+    #[tokio::test]
+    async fn all_tools_excludes_browser_when_disabled() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -379,7 +487,8 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
-        );
+        )
+        .await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
         assert!(names.contains(&"schedule"));
@@ -388,8 +497,8 @@ mod tests {
         assert!(names.contains(&"proxy_config"));
     }
 
-    #[test]
-    fn all_tools_includes_browser_when_enabled() {
+    #[tokio::test]
+    async fn all_tools_includes_browser_when_enabled() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -420,7 +529,8 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
-        );
+        )
+        .await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
         assert!(names.contains(&"content_search"));
@@ -526,8 +636,8 @@ mod tests {
         assert_eq!(parsed.description, "A test tool");
     }
 
-    #[test]
-    fn all_tools_includes_delegate_when_agents_configured() {
+    #[tokio::test]
+    async fn all_tools_includes_delegate_when_agents_configured() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -569,13 +679,14 @@ mod tests {
             &agents,
             Some("delegate-test-credential"),
             &cfg,
-        );
+        )
+        .await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
     }
 
-    #[test]
-    fn all_tools_excludes_delegate_when_no_agents() {
+    #[tokio::test]
+    async fn all_tools_excludes_delegate_when_no_agents() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -601,7 +712,8 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
-        );
+        )
+        .await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
     }

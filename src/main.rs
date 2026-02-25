@@ -67,6 +67,9 @@ mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;
+mod mcp {
+    pub use zeroclaw::mcp::*;
+}
 mod memory;
 mod migration;
 mod multimodal;

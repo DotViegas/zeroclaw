@@ -52,6 +52,9 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod composio {
+    pub use zeroclaw::composio::*;
+}
 mod rag {
     pub use zeroclaw::rag::*;
 }
@@ -458,6 +461,22 @@ Examples:
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+
+    /// Manage Composio integration (health checks, connections)
+    #[command(long_about = "\
+Manage Composio integration.
+
+Check health status, verify connections, and troubleshoot Composio \
+MCP integration issues. Useful for diagnosing OAuth connection \
+problems and toolkit availability.
+
+Examples:
+  zeroclaw composio health
+  zeroclaw composio health --verbose")]
+    Composio {
+        #[command(subcommand)]
+        composio_command: ComposioCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -643,6 +662,110 @@ enum MemoryCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ComposioCommands {
+    /// Check Composio MCP health and connection status
+    Health {
+        /// Show detailed information including all toolkits
+        #[arg(long)]
+        verbose: bool,
+    },
+    
+    /// Connect a toolkit interactively via OAuth
+    Connect {
+        /// Toolkit to connect (e.g., gmail, github, slack)
+        toolkit: String,
+        
+        /// User/entity ID (defaults to config value)
+        #[arg(long)]
+        user_id: Option<String>,
+        
+        /// Timeout in seconds (default: 120)
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+    },
+    
+    /// Disconnect a toolkit (revoke OAuth connection)
+    Disconnect {
+        /// Toolkit to disconnect (e.g., gmail, github, slack)
+        toolkit: String,
+        
+        /// User/entity ID (defaults to config value)
+        #[arg(long)]
+        user_id: Option<String>,
+        
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    
+    /// List available toolkits from Composio
+    ListToolkits {
+        /// Show only connected toolkits
+        #[arg(long)]
+        connected: bool,
+        
+        /// Show only disconnected toolkits
+        #[arg(long)]
+        disconnected: bool,
+    },
+    
+    /// List connected accounts
+    ListConnections {
+        /// Filter by toolkit (e.g., gmail, github)
+        #[arg(long)]
+        toolkit: Option<String>,
+        
+        /// Show detailed information
+        #[arg(long)]
+        verbose: bool,
+    },
+    
+    /// Show overall Composio integration status
+    Status {
+        /// Show detailed information
+        #[arg(long)]
+        verbose: bool,
+    },
+    
+    /// List available tools from MCP server
+    ListTools {
+        /// Filter by toolkit (e.g., gmail, github)
+        #[arg(long)]
+        toolkit: Option<String>,
+        
+        /// Show tool schemas
+        #[arg(long)]
+        schema: bool,
+    },
+    
+    /// Refresh MCP URL with current toolkit configuration
+    Refresh {
+        /// Force refresh even if MCP URL already exists
+        #[arg(long)]
+        force: bool,
+        
+        /// Update config file with new MCP URL
+        #[arg(long)]
+        save: bool,
+    },
+    
+    /// Test a Composio MCP tool
+    Test {
+        /// Tool name to test (e.g., GMAIL_SEND_EMAIL)
+        tool: String,
+        
+        /// Tool arguments as JSON (e.g., '{"to":"test@example.com"}')
+        #[arg(long)]
+        args: Option<String>,
+        
+        /// Show detailed execution information
+        #[arg(long)]
+        verbose: bool,
+    },
+}
+
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -761,19 +884,27 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => agent::run(
-            config,
-            message,
-            provider,
-            model,
-            temperature,
-            peripheral,
-            true,
-        )
-        .await
-        .map(|_| ()),
+        } => {
+            // Set UI mode for Composio MCP onboarding
+            std::env::set_var("ZEROCLAW_UI_MODE", "cli");
+            
+            agent::run(
+                config,
+                message,
+                provider,
+                model,
+                temperature,
+                peripheral,
+                true,
+            )
+            .await
+            .map(|_| ())
+        }
 
         Commands::Gateway { port, host } => {
+            // Set UI mode for Composio MCP onboarding
+            std::env::set_var("ZEROCLAW_UI_MODE", "server");
+            
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -785,6 +916,9 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            // Set UI mode for Composio MCP onboarding
+            std::env::set_var("ZEROCLAW_UI_MODE", "server");
+            
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -995,6 +1129,10 @@ async fn main() -> Result<()> {
             peripherals::handle_command(peripheral_command.clone(), &config).await
         }
 
+        Commands::Composio { composio_command } => {
+            handle_composio_command(composio_command, &config).await
+        }
+
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema => {
                 let schema = schemars::schema_for!(config::Config);
@@ -1172,6 +1310,941 @@ fn print_estop_status(state: &security::EstopState) {
     if let Some(updated_at) = &state.updated_at {
         println!("  updated_at:     {updated_at}");
     }
+}
+
+async fn handle_composio_command(command: ComposioCommands, config: &Config) -> Result<()> {
+    match command {
+        ComposioCommands::Health { verbose } => {
+            // Check if Composio is enabled
+            if !config.composio.enabled {
+                println!("❌ Composio is disabled in configuration");
+                println!("\nTo enable Composio:");
+                println!("  1. Run: zeroclaw onboard");
+                println!("  2. Select 'Composio (managed OAuth)' when prompted");
+                return Ok(());
+            }
+
+            // Check if MCP is configured
+            if !config.composio.mcp.enabled {
+                println!("⚠️  Composio is enabled but MCP integration is disabled");
+                println!("\nTo enable MCP:");
+                println!("  1. Run: zeroclaw onboard");
+                println!("  2. Enable MCP integration when prompted");
+                return Ok(());
+            }
+
+            // Validate configuration
+            use zeroclaw::composio::validation::validate_mcp_config;
+            
+            if let Err(e) = validate_mcp_config(
+                config.composio.mcp.enabled,
+                &config.composio.mcp.mcp_url,
+                &config.composio.mcp.server_id,
+                &config.composio.mcp.toolkits,
+            ) {
+                println!("❌ Configuration validation failed:");
+                println!("   {}", e);
+                return Ok(());
+            }
+
+            println!("✓ Configuration is valid");
+
+            // Get API key
+            let api_key = match &config.composio.api_key {
+                Some(key) => key.clone(),
+                None => {
+                    println!("❌ Composio API key not configured");
+                    return Ok(());
+                }
+            };
+
+            // Create clients
+            use zeroclaw::composio::{ComposioRestClient, check_mcp_health};
+            use zeroclaw::mcp::ComposioMcpClient;
+            use std::sync::Arc;
+
+            let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+            
+            let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
+            
+            let mcp_client = if let Some(mcp_url) = &config.composio.mcp.mcp_url {
+                Arc::new(ComposioMcpClient::new_with_mcp_url(
+                    api_key,
+                    mcp_url.clone(),
+                    config.composio.mcp.server_id.clone(),
+                    Some(user_id.clone()),
+                    std::time::Duration::from_secs(config.composio.mcp.tools_cache_ttl_secs),
+                ))
+            } else if let Some(server_id) = &config.composio.mcp.server_id {
+                Arc::new(ComposioMcpClient::new(
+                    api_key,
+                    server_id.clone(),
+                    user_id.clone(),
+                ))
+            } else {
+                println!("❌ Neither mcp_url nor server_id is configured");
+                return Ok(());
+            };
+
+            // Perform health check
+            println!("\n🔍 Checking Composio MCP health...\n");
+            
+            let health = check_mcp_health(
+                &mcp_client,
+                rest_client,
+                &user_id,
+                &config.composio.mcp.toolkits,
+            ).await;
+
+            // Display results
+            println!("{}", health.status_message());
+
+            if verbose {
+                println!("\nConfiguration:");
+                println!("  User ID: {}", user_id);
+                println!("  Toolkits: {}", config.composio.mcp.toolkits.join(", "));
+                if let Some(url) = &config.composio.mcp.mcp_url {
+                    println!("  MCP URL: {}", url);
+                }
+                if let Some(server_id) = &config.composio.mcp.server_id {
+                    println!("  Server ID: {}", server_id);
+                }
+                
+                if !health.connected_toolkits.is_empty() {
+                    println!("\nConnected Toolkits:");
+                    for toolkit in &health.connected_toolkits {
+                        println!("  ✓ {}", toolkit);
+                    }
+                }
+                
+                if !health.disconnected_toolkits.is_empty() {
+                    println!("\nDisconnected Toolkits:");
+                    for toolkit in &health.disconnected_toolkits {
+                        println!("  ✗ {}", toolkit);
+                        println!("    Run: zeroclaw agent");
+                        println!("    Then use a {} tool to trigger OAuth", toolkit);
+                    }
+                }
+            }
+
+            if !health.is_healthy() {
+                std::process::exit(1);
+            }
+
+            Ok(())
+        }
+        
+        ComposioCommands::Connect { toolkit, user_id, timeout } => {
+            handle_composio_connect(config, &toolkit, user_id.as_deref(), timeout).await
+        }
+        
+        ComposioCommands::Disconnect { toolkit, user_id, yes } => {
+            handle_composio_disconnect(config, &toolkit, user_id.as_deref(), yes).await
+        }
+        
+        ComposioCommands::ListToolkits { connected, disconnected } => {
+            handle_composio_list_toolkits(config, connected, disconnected).await
+        }
+        
+        ComposioCommands::ListConnections { toolkit, verbose } => {
+            handle_composio_list_connections(config, toolkit.as_deref(), verbose).await
+        }
+        
+        ComposioCommands::Status { verbose } => {
+            handle_composio_status(config, verbose).await
+        }
+        
+        ComposioCommands::ListTools { toolkit, schema } => {
+            handle_composio_list_tools(config, toolkit.as_deref(), schema).await
+        }
+        
+        ComposioCommands::Refresh { force, save } => {
+            handle_composio_refresh(config, force, save).await
+        }
+        
+        ComposioCommands::Test { tool, args, verbose } => {
+            handle_composio_test(config, &tool, args.as_deref(), verbose).await
+        }
+    }
+}
+
+async fn handle_composio_connect(
+    config: &Config,
+    toolkit: &str,
+    user_id_override: Option<&str>,
+    timeout_secs: u64,
+) -> Result<()> {
+    use zeroclaw::composio::{ComposioRestClient, normalize_toolkit_slug, CliOnboarding, OnboardingUx};
+    use std::sync::Arc;
+    
+    // Check if Composio is enabled
+    if !config.composio.enabled {
+        bail!("Composio is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Get API key
+    let api_key = config.composio.api_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Composio API key not configured"))?;
+    
+    // Normalize toolkit slug
+    let toolkit_slug = normalize_toolkit_slug(toolkit);
+    
+    // Get user ID
+    let user_id = user_id_override
+        .map(String::from)
+        .or_else(|| config.composio.mcp.user_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    
+    println!("🔗 Connecting {} for user '{}'...\n", toolkit_slug, user_id);
+    
+    // Create REST client
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    
+    // Check if already connected
+    match rest_client.list_connected_accounts(Some(&toolkit_slug), Some(&user_id)).await {
+        Ok(accounts) => {
+            let has_active = accounts.iter().any(|a| a.status.eq_ignore_ascii_case("ACTIVE"));
+            if has_active {
+                println!("✓ {} is already connected!", toolkit_slug);
+                return Ok(());
+            }
+        }
+        Err(_) => {
+            // Continue with connection
+        }
+    }
+    
+    // Determine UX mode
+    let auto_open = !std::env::var("ZEROCLAW_NO_BROWSER")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let ux = if auto_open {
+        OnboardingUx::CliAutoOpen
+    } else {
+        OnboardingUx::CliPrintOnly
+    };
+    
+    // Create onboarding handler
+    let onboarding = CliOnboarding::new(rest_client, ux);
+    
+    // Perform connection with custom timeout
+    println!("Opening OAuth authorization page...");
+    
+    // Get connection URL
+    let link = onboarding.get_connection_url(&toolkit_slug, &user_id).await?;
+    
+    println!("\n🔗 {} OAuth Required", toolkit_slug.to_uppercase());
+    println!("Open this URL in your browser:");
+    println!("  {}", link);
+    
+    // Try to open browser
+    if auto_open {
+        if let Err(e) = open::that(&link) {
+            eprintln!("⚠ Could not auto-open browser: {}", e);
+            println!("Please open the URL manually.");
+        } else {
+            println!("✓ Browser opened automatically");
+        }
+    }
+    
+    // Poll for connection
+    println!("\n⏳ Waiting for authorization (timeout: {}s)...", timeout_secs);
+    println!("Complete the OAuth flow in your browser to continue.\n");
+    
+    match onboarding.poll_until_connected(&toolkit_slug, &user_id, timeout_secs).await {
+        Ok(()) => {
+            println!("✓ {} connected successfully!", toolkit_slug.to_uppercase());
+            println!("\nYou can now use {} tools in your agent.", toolkit_slug);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("\n❌ Connection failed: {}", e);
+            eprintln!("\nTroubleshooting:");
+            eprintln!("  1. Make sure you completed the OAuth flow in your browser");
+            eprintln!("  2. Check that you authorized the correct account");
+            eprintln!("  3. Try again with a longer timeout: --timeout 300");
+            eprintln!("  4. Check your Composio dashboard: https://app.composio.dev");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn handle_composio_list_toolkits(
+    config: &Config,
+    connected_only: bool,
+    disconnected_only: bool,
+) -> Result<()> {
+    use zeroclaw::composio::ComposioRestClient;
+    use std::sync::Arc;
+    
+    // Check if Composio is enabled
+    if !config.composio.enabled {
+        bail!("Composio is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Get API key
+    let api_key = config.composio.api_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Composio API key not configured"))?;
+    
+    // Get user ID
+    let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
+    
+    // Create REST client
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    
+    // Get configured toolkits
+    let configured_toolkits = &config.composio.mcp.toolkits;
+    
+    if configured_toolkits.is_empty() {
+        println!("No toolkits configured.");
+        println!("\nTo add toolkits:");
+        println!("  1. Run: zeroclaw onboard");
+        println!("  2. Enable MCP and select toolkits");
+        return Ok(());
+    }
+    
+    println!("Configured Toolkits:\n");
+    
+    let mut connected = Vec::new();
+    let mut disconnected = Vec::new();
+    
+    // Check connection status for each toolkit
+    for toolkit in configured_toolkits {
+        match rest_client.list_connected_accounts(Some(toolkit), Some(&user_id)).await {
+            Ok(accounts) => {
+                let has_active = accounts.iter().any(|a| a.status.eq_ignore_ascii_case("ACTIVE"));
+                if has_active {
+                    connected.push(toolkit.clone());
+                } else {
+                    disconnected.push(toolkit.clone());
+                }
+            }
+            Err(_) => {
+                disconnected.push(toolkit.clone());
+            }
+        }
+    }
+    
+    // Display based on filters
+    if !connected_only && !disconnected.is_empty() {
+        println!("Disconnected:");
+        for toolkit in &disconnected {
+            println!("  ✗ {}", toolkit);
+        }
+        if !disconnected_only {
+            println!();
+        }
+    }
+    
+    if !disconnected_only && !connected.is_empty() {
+        println!("Connected:");
+        for toolkit in &connected {
+            println!("  ✓ {}", toolkit);
+        }
+    }
+    
+    // Show connection command for disconnected
+    if !disconnected.is_empty() && !connected_only {
+        println!("\nTo connect a toolkit:");
+        println!("  zeroclaw composio connect <toolkit>");
+        println!("\nExample:");
+        println!("  zeroclaw composio connect {}", disconnected[0]);
+    }
+    
+    Ok(())
+}
+
+async fn handle_composio_list_connections(
+    config: &Config,
+    toolkit_filter: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    use zeroclaw::composio::ComposioRestClient;
+    use std::sync::Arc;
+    
+    // Check if Composio is enabled
+    if !config.composio.enabled {
+        bail!("Composio is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Get API key
+    let api_key = config.composio.api_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Composio API key not configured"))?;
+    
+    // Get user ID
+    let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
+    
+    // Create REST client
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    
+    // List connections
+    let accounts = rest_client.list_connected_accounts(toolkit_filter, Some(&user_id)).await?;
+    
+    if accounts.is_empty() {
+        if let Some(toolkit) = toolkit_filter {
+            println!("No connections found for toolkit: {}", toolkit);
+        } else {
+            println!("No connections found.");
+        }
+        println!("\nTo connect a toolkit:");
+        println!("  zeroclaw composio connect <toolkit>");
+        return Ok(());
+    }
+    
+    println!("Connected Accounts:\n");
+    
+    for account in &accounts {
+        let status_icon = if account.status.eq_ignore_ascii_case("ACTIVE") {
+            "✓"
+        } else {
+            "✗"
+        };
+        
+        let toolkit_name = account.toolkit_slug().unwrap_or("unknown");
+        
+        println!("{} {} ({})", status_icon, toolkit_name, account.status);
+        
+        if verbose {
+            println!("  ID: {}", account.id);
+            if let Some(toolkit) = &account.toolkit {
+                if let Some(name) = &toolkit.name {
+                    println!("  Name: {}", name);
+                }
+            }
+            println!();
+        }
+    }
+    
+    if !verbose {
+        println!("\nUse --verbose for more details");
+    }
+    
+    Ok(())
+}
+
+async fn handle_composio_disconnect(
+    config: &Config,
+    toolkit: &str,
+    user_id_override: Option<&str>,
+    skip_confirm: bool,
+) -> Result<()> {
+    use zeroclaw::composio::{ComposioRestClient, normalize_toolkit_slug};
+    use std::sync::Arc;
+    use std::io::{self, Write};
+    
+    // Check if Composio is enabled
+    if !config.composio.enabled {
+        bail!("Composio is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Get API key
+    let api_key = config.composio.api_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Composio API key not configured"))?;
+    
+    // Normalize toolkit slug
+    let toolkit_slug = normalize_toolkit_slug(toolkit);
+    
+    // Get user ID
+    let user_id = user_id_override
+        .map(String::from)
+        .or_else(|| config.composio.mcp.user_id.clone())
+        .unwrap_or_else(|| "default".to_string());
+    
+    println!("🔌 Disconnecting {} for user '{}'...\n", toolkit_slug, user_id);
+    
+    // Create REST client
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    
+    // Check if connected
+    let accounts = rest_client.list_connected_accounts(Some(&toolkit_slug), Some(&user_id)).await?;
+    
+    if accounts.is_empty() {
+        println!("⚠️  {} is not connected", toolkit_slug);
+        return Ok(());
+    }
+    
+    let active_accounts: Vec<_> = accounts.iter()
+        .filter(|a| a.status.eq_ignore_ascii_case("ACTIVE"))
+        .collect();
+    
+    if active_accounts.is_empty() {
+        println!("⚠️  {} has no active connections", toolkit_slug);
+        return Ok(());
+    }
+    
+    // Confirm disconnection
+    if !skip_confirm {
+        println!("This will disconnect {} connection(s) for {}:", active_accounts.len(), toolkit_slug);
+        for account in &active_accounts {
+            println!("  • Connection ID: {}", account.id);
+        }
+        println!();
+        
+        print!("Are you sure you want to disconnect? (y/N): ");
+        io::stdout().flush()?;
+        
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        
+        if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+    
+    // Disconnect each account
+    println!("\nDisconnecting...");
+    
+    let mut success_count = 0;
+    let mut error_count = 0;
+    
+    for account in &active_accounts {
+        match rest_client.delete_connected_account(&account.id).await {
+            Ok(()) => {
+                println!("  ✓ Disconnected connection {}", account.id);
+                success_count += 1;
+            }
+            Err(e) => {
+                eprintln!("  ✗ Failed to disconnect {}: {}", account.id, e);
+                error_count += 1;
+            }
+        }
+    }
+    
+    println!();
+    if error_count == 0 {
+        println!("✓ Successfully disconnected {} from {}", toolkit_slug, user_id);
+        println!("\nTo reconnect:");
+        println!("  zeroclaw composio connect {}", toolkit_slug);
+    } else {
+        eprintln!("⚠️  Disconnected {} connection(s), {} failed", success_count, error_count);
+        std::process::exit(1);
+    }
+    
+    Ok(())
+}
+
+async fn handle_composio_refresh(
+    config: &Config,
+    force: bool,
+    save: bool,
+) -> Result<()> {
+    use zeroclaw::composio::ComposioRestBlockingClient;
+    
+    // Check if Composio is enabled
+    if !config.composio.enabled {
+        bail!("Composio is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Check if MCP is enabled
+    if !config.composio.mcp.enabled {
+        bail!("Composio MCP is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Get API key
+    let api_key = config.composio.api_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Composio API key not configured"))?;
+    
+    // Check if MCP URL already exists
+    if config.composio.mcp.mcp_url.is_some() && !force {
+        println!("⚠️  MCP URL already exists in configuration");
+        println!("\nCurrent URL: {}", config.composio.mcp.mcp_url.as_ref().unwrap());
+        println!("\nUse --force to regenerate anyway");
+        return Ok(());
+    }
+    
+    // Get toolkits
+    let toolkits = &config.composio.mcp.toolkits;
+    if toolkits.is_empty() {
+        bail!("No toolkits configured. Run 'zeroclaw onboard' to add toolkits.");
+    }
+    
+    // Get user ID
+    let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
+    
+    println!("🔄 Generating new MCP URL...");
+    println!("  User ID: {}", user_id);
+    println!("  Toolkits: {}", toolkits.join(", "));
+    println!();
+    
+    // Create blocking client
+    let client = ComposioRestBlockingClient::new(api_key.clone());
+    
+    // Generate MCP URL
+    let mcp_url = if user_id.starts_with("trs_") {
+        // Tool Router Session - construct URL directly
+        let toolkits_param = toolkits.join(",");
+        format!(
+            "https://backend.composio.dev/tool_router/{}/mcp?include_composio_helper_actions=true&user_id={}&toolkits={}",
+            user_id, user_id, toolkits_param
+        )
+    } else {
+        // Regular user ID - use API
+        client.generate_mcp_url(toolkits.clone(), &user_id)?
+    };
+    
+    println!("✓ MCP URL generated successfully\n");
+    println!("New MCP URL:");
+    println!("  {}\n", mcp_url);
+    
+    if save {
+        println!("⚠️  Automatic config saving is not yet implemented");
+        println!("\nTo update your configuration manually:");
+        println!("  1. Edit your config.toml file");
+        println!("  2. Update [composio.mcp].mcp_url with the URL above");
+        println!("  3. Restart your agent or gateway");
+    } else {
+        println!("To save this URL to your configuration:");
+        println!("  1. Edit your config.toml file");
+        println!("  2. Update [composio.mcp].mcp_url with the URL above");
+        println!("  3. Or run: zeroclaw composio refresh --save (when implemented)");
+    }
+    
+    Ok(())
+}
+
+async fn handle_composio_test(
+    config: &Config,
+    tool_name: &str,
+    args_json: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    use zeroclaw::mcp::ComposioMcpClient;
+    use serde_json::Value;
+    
+    // Check if Composio is enabled
+    if !config.composio.enabled {
+        bail!("Composio is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Check if MCP is enabled
+    if !config.composio.mcp.enabled {
+        bail!("Composio MCP is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Get API key
+    let api_key = config.composio.api_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Composio API key not configured"))?;
+    
+    // Get user ID
+    let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
+    
+    // Create MCP client
+    let mcp_client = if let Some(mcp_url) = &config.composio.mcp.mcp_url {
+        ComposioMcpClient::new_with_mcp_url(
+            api_key.clone(),
+            mcp_url.clone(),
+            config.composio.mcp.server_id.clone(),
+            Some(user_id.clone()),
+            std::time::Duration::from_secs(config.composio.mcp.tools_cache_ttl_secs),
+        )
+    } else if let Some(server_id) = &config.composio.mcp.server_id {
+        ComposioMcpClient::new(
+            api_key.clone(),
+            server_id.clone(),
+            user_id.clone(),
+        )
+    } else {
+        bail!("Neither mcp_url nor server_id is configured");
+    };
+    
+    println!("🧪 Testing tool: {}\n", tool_name);
+    
+    // Parse arguments
+    let args: Value = if let Some(json) = args_json {
+        serde_json::from_str(json)
+            .map_err(|e| anyhow::anyhow!("Invalid JSON arguments: {}", e))?
+    } else {
+        serde_json::json!({})
+    };
+    
+    if verbose {
+        println!("Arguments:");
+        println!("{}\n", serde_json::to_string_pretty(&args)?);
+    }
+    
+    // Execute tool
+    println!("Executing...");
+    
+    let start = std::time::Instant::now();
+    let result = mcp_client.execute_tool(tool_name, args).await;
+    let elapsed = start.elapsed();
+    
+    println!();
+    
+    match result {
+        Ok(response) => {
+            if response.is_error() {
+                println!("❌ Tool execution failed");
+                println!("\nError:");
+                println!("{}", response.to_output_string());
+                std::process::exit(1);
+            } else {
+                println!("✓ Tool executed successfully");
+                println!("\nResult:");
+                println!("{}", response.to_output_string());
+                
+                if verbose {
+                    println!("\nExecution time: {:?}", elapsed);
+                }
+            }
+        }
+        Err(e) => {
+            println!("❌ Tool execution failed");
+            println!("\nError: {}", e);
+            
+            if verbose {
+                println!("\nExecution time: {:?}", elapsed);
+            }
+            
+            std::process::exit(1);
+        }
+    }
+    
+    Ok(())
+}
+
+async fn handle_composio_status(config: &Config, verbose: bool) -> Result<()> {
+    use zeroclaw::composio::{ComposioRestClient, check_mcp_health};
+    use zeroclaw::mcp::ComposioMcpClient;
+    use std::sync::Arc;
+    
+    println!("📊 Composio Integration Status\n");
+    
+    // Check if Composio is enabled
+    if !config.composio.enabled {
+        println!("Status: ❌ Disabled");
+        println!("\nTo enable Composio:");
+        println!("  zeroclaw onboard");
+        return Ok(());
+    }
+    
+    println!("Status: ✓ Enabled");
+    
+    // Check API key
+    let api_key = match &config.composio.api_key {
+        Some(key) => {
+            println!("API Key: ✓ Configured");
+            key.clone()
+        }
+        None => {
+            println!("API Key: ❌ Not configured");
+            return Ok(());
+        }
+    };
+    
+    // Check MCP configuration
+    println!("\nMCP Integration:");
+    if !config.composio.mcp.enabled {
+        println!("  Status: ❌ Disabled");
+        return Ok(());
+    }
+    
+    println!("  Status: ✓ Enabled");
+    
+    let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
+    println!("  User ID: {}", user_id);
+    
+    if let Some(url) = &config.composio.mcp.mcp_url {
+        println!("  MCP URL: ✓ Configured");
+        if verbose {
+            println!("    {}", url);
+        }
+    } else if let Some(server_id) = &config.composio.mcp.server_id {
+        println!("  Server ID: ✓ Configured ({})", server_id);
+    } else {
+        println!("  Configuration: ❌ Neither mcp_url nor server_id configured");
+        return Ok(());
+    }
+    
+    // Toolkits
+    println!("\nToolkits:");
+    if config.composio.mcp.toolkits.is_empty() {
+        println!("  ⚠️  No toolkits configured");
+    } else {
+        println!("  Count: {}", config.composio.mcp.toolkits.len());
+        if verbose {
+            for toolkit in &config.composio.mcp.toolkits {
+                println!("    • {}", toolkit);
+            }
+        } else {
+            println!("  {}", config.composio.mcp.toolkits.join(", "));
+        }
+    }
+    
+    // Create clients for health check
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    
+    let mcp_client = if let Some(mcp_url) = &config.composio.mcp.mcp_url {
+        Arc::new(ComposioMcpClient::new_with_mcp_url(
+            api_key,
+            mcp_url.clone(),
+            config.composio.mcp.server_id.clone(),
+            Some(user_id.clone()),
+            std::time::Duration::from_secs(config.composio.mcp.tools_cache_ttl_secs),
+        ))
+    } else if let Some(server_id) = &config.composio.mcp.server_id {
+        Arc::new(ComposioMcpClient::new(
+            api_key,
+            server_id.clone(),
+            user_id.clone(),
+        ))
+    } else {
+        return Ok(());
+    };
+    
+    // Health check
+    println!("\nHealth Check:");
+    let health = check_mcp_health(
+        &mcp_client,
+        rest_client.clone(),
+        &user_id,
+        &config.composio.mcp.toolkits,
+    ).await;
+    
+    if health.is_healthy() {
+        println!("  ✓ MCP server is healthy");
+        println!("  Tools available: {}", health.tools_count);
+    } else {
+        println!("  ❌ MCP server is unhealthy");
+        if let Some(error) = &health.error {
+            println!("  Error: {}", error);
+        }
+    }
+    
+    // Connection status
+    if !config.composio.mcp.toolkits.is_empty() {
+        println!("\nConnection Status:");
+        
+        if !health.connected_toolkits.is_empty() {
+            println!("  Connected ({}):", health.connected_toolkits.len());
+            for toolkit in &health.connected_toolkits {
+                println!("    ✓ {}", toolkit);
+            }
+        }
+        
+        if !health.disconnected_toolkits.is_empty() {
+            println!("  Disconnected ({}):", health.disconnected_toolkits.len());
+            for toolkit in &health.disconnected_toolkits {
+                println!("    ✗ {}", toolkit);
+            }
+        }
+    }
+    
+    // Summary
+    println!("\nQuick Actions:");
+    if !health.disconnected_toolkits.is_empty() {
+        println!("  • Connect toolkit: zeroclaw composio connect <toolkit>");
+    }
+    println!("  • Health check: zeroclaw composio health --verbose");
+    println!("  • List tools: zeroclaw composio list-tools");
+    
+    Ok(())
+}
+
+async fn handle_composio_list_tools(
+    config: &Config,
+    toolkit_filter: Option<&str>,
+    show_schema: bool,
+) -> Result<()> {
+    use zeroclaw::mcp::ComposioMcpClient;
+    use zeroclaw::composio::normalize_toolkit_slug;
+    
+    // Check if Composio is enabled
+    if !config.composio.enabled {
+        bail!("Composio is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Check if MCP is enabled
+    if !config.composio.mcp.enabled {
+        bail!("Composio MCP is not enabled. Run 'zeroclaw onboard' to configure.");
+    }
+    
+    // Get API key
+    let api_key = config.composio.api_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Composio API key not configured"))?;
+    
+    // Get user ID
+    let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
+    
+    // Create MCP client
+    let mcp_client = if let Some(mcp_url) = &config.composio.mcp.mcp_url {
+        ComposioMcpClient::new_with_mcp_url(
+            api_key.clone(),
+            mcp_url.clone(),
+            config.composio.mcp.server_id.clone(),
+            Some(user_id.clone()),
+            std::time::Duration::from_secs(config.composio.mcp.tools_cache_ttl_secs),
+        )
+    } else if let Some(server_id) = &config.composio.mcp.server_id {
+        ComposioMcpClient::new(
+            api_key.clone(),
+            server_id.clone(),
+            user_id.clone(),
+        )
+    } else {
+        bail!("Neither mcp_url nor server_id is configured");
+    };
+    
+    println!("🔧 Listing Composio MCP Tools\n");
+    
+    // List tools
+    let tools = mcp_client.list_tools().await?;
+    
+    if tools.is_empty() {
+        println!("No tools available.");
+        println!("\nPossible reasons:");
+        println!("  • No toolkits configured");
+        println!("  • No toolkits connected");
+        println!("  • MCP server issue");
+        return Ok(());
+    }
+    
+    // Filter by toolkit if specified
+    let filtered_tools: Vec<_> = if let Some(filter) = toolkit_filter {
+        let normalized_filter = normalize_toolkit_slug(filter);
+        tools.into_iter()
+            .filter(|tool| {
+                tool.name.to_lowercase().starts_with(&normalized_filter)
+                    || tool.name.to_lowercase().contains(&format!("_{}_", normalized_filter))
+            })
+            .collect()
+    } else {
+        tools
+    };
+    
+    if filtered_tools.is_empty() {
+        if let Some(filter) = toolkit_filter {
+            println!("No tools found for toolkit: {}", filter);
+        } else {
+            println!("No tools available.");
+        }
+        return Ok(());
+    }
+    
+    println!("Found {} tool(s):\n", filtered_tools.len());
+    
+    for tool in &filtered_tools {
+        println!("• {}", tool.name);
+        
+        if let Some(desc) = &tool.description {
+            println!("  {}", desc);
+        }
+        
+        if show_schema {
+            println!("  Schema:");
+            println!("  {}", serde_json::to_string_pretty(&tool.input_schema)?);
+            println!();
+        }
+    }
+    
+    if !show_schema {
+        println!("\nUse --schema to see tool input schemas");
+    }
+    
+    println!("\nTo test a tool:");
+    println!("  zeroclaw composio test <TOOL_NAME>");
+    
+    Ok(())
 }
 
 fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {

@@ -7,6 +7,9 @@
 // The Composio API key is stored in the encrypted secret store.
 
 use super::traits::{Tool, ToolResult};
+use crate::composio::{
+    ComposioConnectedAccount, ComposioConnectionLink, ComposioRestClient, ComposioToolkitRef,
+};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use anyhow::Context;
@@ -34,6 +37,7 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
 
 /// A tool that proxies actions to the Composio managed tool platform.
 pub struct ComposioTool {
+    rest_client: Arc<ComposioRestClient>,
     api_key: String,
     default_entity_id: String,
     security: Arc<SecurityPolicy>,
@@ -46,7 +50,9 @@ impl ComposioTool {
         default_entity_id: Option<&str>,
         security: Arc<SecurityPolicy>,
     ) -> Self {
+        let rest_client = Arc::new(ComposioRestClient::new(api_key.to_string()));
         Self {
+            rest_client,
             api_key: api_key.to_string(),
             default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
             security,
@@ -126,45 +132,22 @@ impl ComposioTool {
     }
 
     /// List connected accounts for a user and optional toolkit/app.
-    async fn list_connected_accounts(
+    /// List connected accounts for a given app and entity
+    ///
+    /// # Arguments
+    /// * `app_name` - Optional app name filter (e.g., "gmail", "github")
+    /// * `entity_id` - Optional entity ID filter
+    ///
+    /// # Returns
+    /// Vector of connected accounts
+    pub async fn list_connected_accounts(
         &self,
         app_name: Option<&str>,
         entity_id: Option<&str>,
     ) -> anyhow::Result<Vec<ComposioConnectedAccount>> {
-        let url = format!("{COMPOSIO_API_BASE_V3}/connected_accounts");
-        let mut req = self.client().get(&url).header("x-api-key", &self.api_key);
-
-        req = req.query(&[
-            ("limit", "50"),
-            ("order_by", "updated_at"),
-            ("order_direction", "desc"),
-            ("statuses", "INITIALIZING"),
-            ("statuses", "ACTIVE"),
-            ("statuses", "INITIATED"),
-        ]);
-
-        if let Some(app) = app_name
-            .map(normalize_app_slug)
-            .filter(|app| !app.is_empty())
-        {
-            req = req.query(&[("toolkit_slugs", app.as_str())]);
-        }
-
-        if let Some(entity) = entity_id {
-            req = req.query(&[("user_ids", entity)]);
-        }
-
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            let err = response_error(resp).await;
-            anyhow::bail!("Composio v3 connected accounts lookup failed: {err}");
-        }
-
-        let body: ComposioConnectedAccountsResponse = resp
-            .json()
+        self.rest_client
+            .list_connected_accounts(app_name, entity_id)
             .await
-            .context("Failed to decode Composio v3 connected accounts response")?;
-        Ok(body.items)
     }
 
     fn cache_connected_account(&self, app_name: &str, entity_id: &str, connected_account_id: &str) {
@@ -406,155 +389,9 @@ impl ComposioTool {
         auth_config_id: Option<&str>,
         entity_id: &str,
     ) -> anyhow::Result<ComposioConnectionLink> {
-        let v3 = self
-            .get_connection_url_v3(app_name, auth_config_id, entity_id)
-            .await;
-        match v3 {
-            Ok(url) => Ok(url),
-            Err(v3_err) => {
-                let app = app_name.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Composio v3 connect failed ({v3_err}) and v2 fallback requires 'app'"
-                    )
-                })?;
-                match self.get_connection_url_v2(app, entity_id).await {
-                    Ok(url) => Ok(url),
-                    Err(v2_err) => anyhow::bail!(
-                        "Composio connect failed on v3 ({v3_err}) and v2 fallback ({v2_err})"
-                    ),
-                }
-            }
-        }
-    }
-
-    async fn get_connection_url_v3(
-        &self,
-        app_name: Option<&str>,
-        auth_config_id: Option<&str>,
-        entity_id: &str,
-    ) -> anyhow::Result<ComposioConnectionLink> {
-        let auth_config_id = match auth_config_id {
-            Some(id) => id.to_string(),
-            None => {
-                let app = app_name.ok_or_else(|| {
-                    anyhow::anyhow!("Missing 'app' or 'auth_config_id' for v3 connect")
-                })?;
-                self.resolve_auth_config_id(app).await?
-            }
-        };
-
-        let url = format!("{COMPOSIO_API_BASE_V3}/connected_accounts/link");
-        let body = json!({
-            "auth_config_id": auth_config_id,
-            "user_id": entity_id,
-        });
-
-        let resp = self
-            .client()
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = response_error(resp).await;
-            anyhow::bail!("Composio v3 connect failed: {err}");
-        }
-
-        let result: serde_json::Value = resp
-            .json()
+        self.rest_client
+            .get_connection_url(app_name, auth_config_id, entity_id)
             .await
-            .context("Failed to decode Composio v3 connect response")?;
-        let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v3 response"))?;
-        Ok(ComposioConnectionLink {
-            redirect_url,
-            connected_account_id: extract_connected_account_id(&result),
-        })
-    }
-
-    async fn get_connection_url_v2(
-        &self,
-        app_name: &str,
-        entity_id: &str,
-    ) -> anyhow::Result<ComposioConnectionLink> {
-        let url = format!("{COMPOSIO_API_BASE_V2}/connectedAccounts");
-
-        let body = json!({
-            "integrationId": app_name,
-            "entityId": entity_id,
-        });
-
-        let resp = self
-            .client()
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = response_error(resp).await;
-            anyhow::bail!("Composio v2 connect failed: {err}");
-        }
-
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .context("Failed to decode Composio v2 connect response")?;
-        let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v2 response"))?;
-        Ok(ComposioConnectionLink {
-            redirect_url,
-            connected_account_id: extract_connected_account_id(&result),
-        })
-    }
-
-    async fn resolve_auth_config_id(&self, app_name: &str) -> anyhow::Result<String> {
-        let url = format!("{COMPOSIO_API_BASE_V3}/auth_configs");
-
-        let resp = self
-            .client()
-            .get(&url)
-            .header("x-api-key", &self.api_key)
-            .query(&[
-                ("toolkit_slug", app_name),
-                ("show_disabled", "true"),
-                ("limit", "25"),
-            ])
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = response_error(resp).await;
-            anyhow::bail!("Composio v3 auth config lookup failed: {err}");
-        }
-
-        let body: ComposioAuthConfigsResponse = resp
-            .json()
-            .await
-            .context("Failed to decode Composio v3 auth configs response")?;
-
-        if body.items.is_empty() {
-            anyhow::bail!(
-                "No authentication configuration found for app '{app_name}'. \
-                 \nTo fix this:\
-                 \n1. Visit https://app.composio.dev/apps and search for '{app_name}'\
-                 \n2. Click 'Add Integration' or 'Configure' for {app_name}\
-                 \n3. Follow the setup wizard to create an auth config\
-                 \n4. Once created, retry action='connect' with app='{app_name}'"
-            );
-        }
-
-        let preferred = body
-            .items
-            .iter()
-            .find(|cfg| cfg.is_enabled())
-            .or_else(|| body.items.first())
-            .context("No usable auth config returned by Composio")?;
-
-        Ok(preferred.id.clone())
     }
 }
 
@@ -1056,39 +893,7 @@ fn map_v3_tools_to_actions(items: Vec<ComposioV3Tool>) -> Vec<ComposioAction> {
         .collect()
 }
 
-fn extract_redirect_url(result: &serde_json::Value) -> Option<String> {
-    result
-        .get("redirect_url")
-        .and_then(|v| v.as_str())
-        .or_else(|| result.get("redirectUrl").and_then(|v| v.as_str()))
-        .or_else(|| {
-            result
-                .get("data")
-                .and_then(|v| v.get("redirect_url"))
-                .and_then(|v| v.as_str())
-        })
-        .map(ToString::to_string)
-}
-
-fn extract_connected_account_id(result: &serde_json::Value) -> Option<String> {
-    result
-        .get("connected_account_id")
-        .and_then(|v| v.as_str())
-        .or_else(|| result.get("connectedAccountId").and_then(|v| v.as_str()))
-        .or_else(|| {
-            result
-                .get("data")
-                .and_then(|v| v.get("connected_account_id"))
-                .and_then(|v| v.as_str())
-        })
-        .or_else(|| {
-            result
-                .get("data")
-                .and_then(|v| v.get("connectedAccountId"))
-                .and_then(|v| v.as_str())
-        })
-        .map(ToString::to_string)
-}
+// ── Helper functions ──────────────────────────────────────────
 
 async fn response_error(resp: reqwest::Response) -> String {
     let status = resp.status();
@@ -1096,56 +901,7 @@ async fn response_error(resp: reqwest::Response) -> String {
     if body.trim().is_empty() {
         return format!("HTTP {}", status.as_u16());
     }
-
-    if let Some(api_error) = extract_api_error_message(&body) {
-        return format!(
-            "HTTP {}: {}",
-            status.as_u16(),
-            sanitize_error_message(&api_error)
-        );
-    }
-
-    format!("HTTP {}", status.as_u16())
-}
-
-fn sanitize_error_message(message: &str) -> String {
-    let mut sanitized = message.replace('\n', " ");
-    for marker in [
-        "connected_account_id",
-        "connectedAccountId",
-        "entity_id",
-        "entityId",
-        "user_id",
-        "userId",
-    ] {
-        sanitized = sanitized.replace(marker, "[redacted]");
-    }
-
-    let max_chars = 240;
-    if sanitized.chars().count() <= max_chars {
-        sanitized
-    } else {
-        let mut end = max_chars;
-        while end > 0 && !sanitized.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &sanitized[..end])
-    }
-}
-
-fn extract_api_error_message(body: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed
-        .get("error")
-        .and_then(|v| v.get("message"))
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
-        .or_else(|| {
-            parsed
-                .get("message")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string)
-        })
+    format!("HTTP {}: {}", status.as_u16(), body.chars().take(200).collect::<String>())
 }
 
 // ── API response types ──────────────────────────────────────────
@@ -1162,35 +918,6 @@ struct ComposioToolsResponse {
     items: Vec<ComposioV3Tool>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ComposioConnectedAccountsResponse {
-    #[serde(default)]
-    items: Vec<ComposioConnectedAccount>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ComposioConnectedAccount {
-    id: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    toolkit: Option<ComposioToolkitRef>,
-}
-
-impl ComposioConnectedAccount {
-    fn is_usable(&self) -> bool {
-        self.status.eq_ignore_ascii_case("INITIALIZING")
-            || self.status.eq_ignore_ascii_case("ACTIVE")
-            || self.status.eq_ignore_ascii_case("INITIATED")
-    }
-
-    fn toolkit_slug(&self) -> Option<&str> {
-        self.toolkit
-            .as_ref()
-            .and_then(|toolkit| toolkit.slug.as_deref())
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct ComposioV3Tool {
     #[serde(default)]
@@ -1203,45 +930,6 @@ struct ComposioV3Tool {
     app_name: Option<String>,
     #[serde(default)]
     toolkit: Option<ComposioToolkitRef>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ComposioToolkitRef {
-    #[serde(default)]
-    slug: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ComposioAuthConfigsResponse {
-    #[serde(default)]
-    items: Vec<ComposioAuthConfig>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ComposioConnectionLink {
-    pub redirect_url: String,
-    pub connected_account_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ComposioAuthConfig {
-    id: String,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    enabled: Option<bool>,
-}
-
-impl ComposioAuthConfig {
-    fn is_enabled(&self) -> bool {
-        self.enabled.unwrap_or(false)
-            || self
-                .status
-                .as_deref()
-                .is_some_and(|v| v.eq_ignore_ascii_case("enabled"))
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

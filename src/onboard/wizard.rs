@@ -2731,78 +2731,128 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
             println!();
             println!(
                 "  {} {}",
-                style("MCP Integration (Optional)").white().bold(),
-                style("— Advanced: Auto-load tools from your OAuth connections").dim()
+                style("MCP Integration (Recommended)").white().bold(),
+                style("— Auto-load tools from your OAuth connections").dim()
             );
             print_bullet("MCP provides seamless tool integration without 3-step workflow");
-            print_bullet("Requires MCP server setup at: https://app.composio.dev/mcp");
+            print_bullet("We'll generate an MCP URL automatically for you");
             println!();
 
             let use_mcp = Confirm::new()
-                .with_prompt("  Configure Composio MCP integration?")
-                .default(false)
+                .with_prompt("  Enable Composio MCP integration?")
+                .default(true)
                 .interact()?;
 
             let mcp_config = if use_mcp {
                 println!();
-                print_bullet("To use MCP, you need to:");
-                println!("    1. Create an MCP server at https://app.composio.dev/mcp");
-                println!("    2. Add toolkits (Dropbox, Gmail, etc.) with OAuth configs");
-                println!("    3. Copy the server ID from the dashboard");
+                print_bullet("Select toolkits to enable (you can add more later):");
                 println!();
 
-                let server_id: String = Input::new()
-                    .with_prompt("  MCP Server ID (or Enter to skip)")
-                    .allow_empty(true)
-                    .interact_text()?;
+                // Toolkit selection
+                let available_toolkits = vec![
+                    ("gmail", "Gmail - Email management"),
+                    ("github", "GitHub - Repository management"),
+                    ("slack", "Slack - Team communication"),
+                    ("dropbox", "Dropbox - File storage"),
+                    ("notion", "Notion - Note-taking & docs"),
+                    ("calendar", "Google Calendar - Scheduling"),
+                ];
 
-                if server_id.trim().is_empty() {
+                let mut selected_toolkits = Vec::new();
+                
+                for (slug, description) in &available_toolkits {
+                    let enable = Confirm::new()
+                        .with_prompt(format!("    Enable {}?", description))
+                        .default(false)
+                        .interact()?;
+                    
+                    if enable {
+                        selected_toolkits.push(slug.to_string());
+                    }
+                }
+
+                if selected_toolkits.is_empty() {
+                    println!();
+                    print_bullet("No toolkits selected. You can configure them later in config.toml");
                     println!(
-                        "  {} MCP skipped — you can configure it later in config.toml",
-                        style("→").dim()
+                        "  {} MCP: {} — configure toolkits later",
+                        style("→").dim(),
+                        style("skipped").dim()
                     );
                     ComposioMcpConfig::default()
                 } else {
+                    // Get user ID
                     let user_id: String = Input::new()
-                        .with_prompt("  MCP User ID (or Enter to use default)")
-                        .allow_empty(true)
+                        .with_prompt("  MCP User ID (default: 'default')")
+                        .default("default".to_string())
                         .interact_text()?;
 
-                    let user_id_opt = if user_id.trim().is_empty() {
-                        None
-                    } else {
-                        Some(user_id.trim().to_string())
-                    };
-
-                    // Ask for MCP-specific API key
+                    // Generate MCP URL
                     println!();
-                    print_bullet("If your MCP session has a different API key (starts with 'ak_'),");
-                    print_bullet("enter it here. Otherwise, leave blank to use the main Composio API key.");
-                    println!();
+                    println!("  {} Generating MCP URL...", style("⚙").cyan());
+                    
+                    match generate_mcp_url_blocking(&api_key, selected_toolkits.clone(), &user_id) {
+                        Ok(mcp_url) => {
+                            println!(
+                                "  {} MCP URL generated successfully",
+                                style("✓").green().bold()
+                            );
+                            
+                            // Ask if user wants to connect a toolkit now
+                            println!();
+                            let connect_now = Confirm::new()
+                                .with_prompt("  Connect a toolkit now? (recommended)")
+                                .default(true)
+                                .interact()?;
 
-                    let mcp_api_key: String = Input::new()
-                        .with_prompt("  MCP API Key (or Enter to use main API key)")
-                        .allow_empty(true)
-                        .interact_text()?;
+                            if connect_now && !selected_toolkits.is_empty() {
+                                // Let user pick which toolkit to connect
+                                let toolkit_names: Vec<&str> = selected_toolkits.iter().map(|s| s.as_str()).collect();
+                                let toolkit_idx = Select::new()
+                                    .with_prompt("  Which toolkit to connect?")
+                                    .items(&toolkit_names)
+                                    .default(0)
+                                    .interact()?;
 
-                    let mcp_api_key_opt = if mcp_api_key.trim().is_empty() {
-                        None
-                    } else {
-                        Some(mcp_api_key.trim().to_string())
-                    };
+                                let toolkit = &selected_toolkits[toolkit_idx];
+                                
+                                match connect_toolkit_blocking(&api_key, toolkit, &user_id) {
+                                    Ok(()) => {
+                                        println!(
+                                            "  {} {} connected successfully!",
+                                            style("✓").green().bold(),
+                                            toolkit.to_uppercase()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "  {} Failed to connect {}: {}",
+                                            style("⚠").yellow(),
+                                            toolkit,
+                                            e
+                                        );
+                                        print_bullet("You can connect it later using the agent");
+                                    }
+                                }
+                            }
 
-                    println!(
-                        "  {} MCP: {} — tools will auto-load from your OAuth connections",
-                        style("✓").green().bold(),
-                        style("enabled").green()
-                    );
-
-                    ComposioMcpConfig {
-                        enabled: true,
-                        server_id: Some(server_id.trim().to_string()),
-                        user_id: user_id_opt,
-                        api_key: mcp_api_key_opt,
-                        ..ComposioMcpConfig::default()
+                            ComposioMcpConfig {
+                                enabled: true,
+                                mcp_url: Some(mcp_url),
+                                user_id: Some(user_id),
+                                toolkits: selected_toolkits,
+                                ..ComposioMcpConfig::default()
+                            }
+                        }
+                        Err(e) => {
+                            println!(
+                                "  {} Failed to generate MCP URL: {}",
+                                style("⚠").yellow(),
+                                e
+                            );
+                            print_bullet("You can configure MCP manually later in config.toml");
+                            ComposioMcpConfig::default()
+                        }
                     }
                 }
             } else {
@@ -7276,4 +7326,62 @@ mod tests {
         });
         assert!(has_launchable_channels(&channels));
     }
+}
+
+// ── Composio MCP Helper Functions ──────────────────────────────
+
+/// Generate MCP URL using blocking HTTP client
+fn generate_mcp_url_blocking(
+    api_key: &str,
+    toolkits: Vec<String>,
+    user_id: &str,
+) -> Result<String> {
+    use crate::composio::ComposioRestBlockingClient;
+
+    // Check if this is a Tool Router Session ID (starts with "trs_")
+    if user_id.starts_with("trs_") {
+        // Tool Router Sessions don't need API generation - construct URL directly
+        let toolkits_param = toolkits.join(",");
+        let mcp_url = format!(
+            "https://backend.composio.dev/tool_router/{}/mcp?include_composio_helper_actions=true&user_id={}&toolkits={}",
+            user_id, user_id, toolkits_param
+        );
+        return Ok(mcp_url);
+    }
+
+    // For regular user IDs, use the API to generate the URL
+    let client = ComposioRestBlockingClient::new(api_key.to_string());
+    client.generate_mcp_url(toolkits, user_id)
+}
+
+/// Connect a toolkit and wait for OAuth completion
+fn connect_toolkit_blocking(api_key: &str, toolkit: &str, user_id: &str) -> Result<()> {
+    use crate::composio::ComposioRestBlockingClient;
+
+    let client = ComposioRestBlockingClient::new(api_key.to_string());
+
+    // Get connection URL
+    let url = client.get_connection_url(toolkit, user_id)?;
+
+    println!();
+    println!("  {} Opening OAuth page in your browser...", style("🔗").cyan());
+    println!("  URL: {}", style(&url).dim());
+    println!();
+
+    // Try to open browser
+    if let Err(e) = open::that(&url) {
+        println!(
+            "  {} Could not auto-open browser: {}",
+            style("⚠").yellow(),
+            e
+        );
+        println!("  Please open the URL manually in your browser.");
+    }
+
+    println!("  {} Waiting for authorization (timeout: 60s)...", style("⏳").cyan());
+
+    // Poll for connection (60 second timeout for wizard)
+    client.poll_until_connected(toolkit, user_id, 60)?;
+
+    Ok(())
 }

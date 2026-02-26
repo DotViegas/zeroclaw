@@ -10,6 +10,8 @@ use anyhow::Context;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 const COMPOSIO_MCP_BASE_URL: &str = "https://backend.composio.dev/tool_router";
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -46,16 +48,29 @@ pub struct ComposioMcpClient {
     user_id: String,
     mcp_url: String,
     client: Client,
+    /// TTL cache for tools list
+    tools_cache: RwLock<Option<(Instant, Vec<McpTool>)>>,
+    tools_cache_ttl: Duration,
 }
 
 impl ComposioMcpClient {
-    /// Create a new Composio MCP client
+    /// Create a new Composio MCP client (legacy: uses server_id)
     ///
     /// # Arguments
     /// * `api_key` - Composio API key for authentication
     /// * `server_id` - MCP server ID (created via Composio dashboard or API)
     /// * `user_id` - User/entity ID for this MCP instance
     pub fn new(api_key: String, server_id: String, user_id: String) -> Self {
+        Self::new_with_ttl(api_key, server_id, user_id, Duration::from_secs(600))
+    }
+
+    /// Create a new Composio MCP client with custom TTL
+    pub fn new_with_ttl(
+        api_key: String,
+        server_id: String,
+        user_id: String,
+        tools_cache_ttl: Duration,
+    ) -> Self {
         // Detect if this is a Tool Router Session (starts with "trs_") or Dedicated MCP Server
         let mcp_url = if server_id.starts_with("trs_") {
             // Tool Router Session format
@@ -83,6 +98,40 @@ impl ComposioMcpClient {
             user_id,
             mcp_url,
             client,
+            tools_cache: RwLock::new(None),
+            tools_cache_ttl,
+        }
+    }
+
+    /// Create a new Composio MCP client with generated MCP URL (recommended)
+    ///
+    /// # Arguments
+    /// * `api_key` - Composio API key for authentication
+    /// * `mcp_url` - Generated MCP URL from Composio API
+    /// * `server_id` - Optional server ID for reference
+    /// * `user_id` - Optional user ID for reference
+    /// * `tools_cache_ttl` - TTL for tools list cache
+    pub fn new_with_mcp_url(
+        api_key: String,
+        mcp_url: String,
+        server_id: Option<String>,
+        user_id: Option<String>,
+        tools_cache_ttl: Duration,
+    ) -> Self {
+        let client = crate::config::build_runtime_proxy_client_with_timeouts(
+            "mcp.composio",
+            DEFAULT_TIMEOUT_SECS,
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+        );
+
+        Self {
+            api_key,
+            server_id: server_id.unwrap_or_else(|| "generated".to_string()),
+            user_id: user_id.unwrap_or_else(|| "default".to_string()),
+            mcp_url,
+            client,
+            tools_cache: RwLock::new(None),
+            tools_cache_ttl,
         }
     }
 
@@ -90,7 +139,32 @@ impl ComposioMcpClient {
     ///
     /// This fetches all tools that are available based on the server's
     /// configured toolkits and the user's connected accounts.
+    /// Results are cached with TTL to avoid excessive API calls.
     pub async fn list_tools(&self) -> anyhow::Result<Vec<McpTool>> {
+        // Check cache first
+        {
+            let cache = self.tools_cache.read().await;
+            if let Some((cached_at, cached_tools)) = cache.as_ref() {
+                if cached_at.elapsed() < self.tools_cache_ttl {
+                    return Ok(cached_tools.clone());
+                }
+            }
+        }
+
+        // Cache miss or expired - fetch from remote
+        let tools = self.fetch_tools_from_remote().await?;
+
+        // Update cache
+        {
+            let mut cache = self.tools_cache.write().await;
+            *cache = Some((Instant::now(), tools.clone()));
+        }
+
+        Ok(tools)
+    }
+
+    /// Fetch tools from remote MCP server (bypasses cache)
+    async fn fetch_tools_from_remote(&self) -> anyhow::Result<Vec<McpTool>> {
         // MCP uses JSON-RPC 2.0 protocol
         let request_body = serde_json::json!({
             "jsonrpc": "2.0",

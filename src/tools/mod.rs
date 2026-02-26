@@ -19,6 +19,7 @@ pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
 pub mod composio;
+pub mod composio_meta;
 pub mod composio_mcp;
 pub mod content_search;
 pub mod cron_add;
@@ -55,6 +56,7 @@ pub mod web_search_tool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
+pub use composio_meta::ComposioMetaTool;
 pub use composio_mcp::ComposioMcpTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -99,6 +101,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone)]
 struct ArcDelegatingTool {
@@ -177,10 +180,15 @@ pub async fn load_composio_mcp_tools(
         return Ok(Vec::new());
     }
 
-    let server_id = mcp_config
-        .server_id
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("MCP server_id not configured"))?;
+    // Validate configuration before proceeding
+    use anyhow::Context;
+    crate::composio::validate_mcp_config(
+        mcp_config.enabled,
+        &mcp_config.mcp_url,
+        &mcp_config.server_id,
+        &mcp_config.toolkits,
+    )
+    .context("Invalid Composio MCP configuration")?;
 
     // Use MCP-specific API key if provided, otherwise fall back to main Composio API key
     let mcp_api_key = mcp_config
@@ -194,12 +202,37 @@ pub async fn load_composio_mcp_tools(
         .as_deref()
         .unwrap_or(entity_id_fallback);
 
-    // Create MCP client
-    let client = Arc::new(ComposioMcpClient::new(
-        mcp_api_key.to_string(),
-        server_id.clone(),
-        user_id.to_string(),
-    ));
+    let ttl = Duration::from_secs(mcp_config.tools_cache_ttl_secs);
+
+    tracing::info!(
+        mcp_url = mcp_config.mcp_url.as_deref(),
+        server_id = mcp_config.server_id.as_deref(),
+        user_id = user_id,
+        toolkits = ?mcp_config.toolkits,
+        "Loading Composio MCP tools"
+    );
+
+    // Create MCP client - prefer mcp_url over server_id
+    let client = if let Some(mcp_url) = &mcp_config.mcp_url {
+        // Recommended: use generated MCP URL
+        Arc::new(ComposioMcpClient::new_with_mcp_url(
+            mcp_api_key.to_string(),
+            mcp_url.clone(),
+            mcp_config.server_id.clone(),
+            Some(user_id.to_string()),
+            ttl,
+        ))
+    } else if let Some(server_id) = &mcp_config.server_id {
+        // Legacy: use server_id
+        Arc::new(ComposioMcpClient::new_with_ttl(
+            mcp_api_key.to_string(),
+            server_id.clone(),
+            user_id.to_string(),
+            ttl,
+        ))
+    } else {
+        anyhow::bail!("MCP configuration requires either mcp_url or server_id");
+    };
 
     // Fetch available tools from MCP server
     let mcp_tools: Vec<McpTool> = client.list_tools().await?;
@@ -209,20 +242,110 @@ pub async fn load_composio_mcp_tools(
         return Ok(Vec::new());
     }
 
+    // Detect Pattern 2 (meta-tools) vs Pattern 1 (direct app tools)
+    let has_search_tools = mcp_tools.iter().any(|t| t.name == "COMPOSIO_SEARCH_TOOLS");
+    let has_multi_execute = mcp_tools.iter().any(|t| t.name == "COMPOSIO_MULTI_EXECUTE_TOOL");
+    let is_pattern_2 = has_search_tools && has_multi_execute;
+
+    if is_pattern_2 {
+        eprintln!(
+            "Info: Detected Composio Pattern 2 (meta-tools) - Dynamic discovery enabled for 1000+ tools"
+        );
+        tracing::info!(
+            "Composio Pattern 2 detected: using dynamic tool discovery via meta-tools"
+        );
+
+        // Create REST client for meta-tool
+        let rest_client = Arc::new(crate::composio::ComposioRestClient::new(api_key.to_string()));
+
+        // Create onboarding handler
+        let onboarding: Option<Arc<dyn crate::composio::ComposioOnboarding>> = {
+            use crate::composio::{CliOnboarding, OnboardingUx, ServerOnboarding};
+
+            let ui_mode = std::env::var("ZEROCLAW_UI_MODE")
+                .unwrap_or_else(|_| "cli".to_string());
+
+            match ui_mode.as_str() {
+                "server" => Some(Arc::new(ServerOnboarding::new(rest_client.clone()))),
+                "cli" => {
+                    let no_browser = std::env::var("ZEROCLAW_NO_BROWSER")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+
+                    let ux = if no_browser {
+                        OnboardingUx::CliPrintOnly
+                    } else {
+                        OnboardingUx::CliAutoOpen
+                    };
+
+                    Some(Arc::new(CliOnboarding::new(rest_client.clone(), ux)))
+                }
+                _ => None,
+            }
+        };
+
+        // Create single meta-tool that wraps all discovery and execution
+        let meta_tool = Arc::new(ComposioMetaTool::new(
+            client,
+            rest_client,
+            security,
+            onboarding,
+        )) as Arc<dyn Tool>;
+
+        return Ok(vec![meta_tool]);
+    }
+
+    // Pattern 1: Direct app tools
     eprintln!(
-        "Info: Loaded {} tools from Composio MCP server ({})",
+        "Info: Loaded {} tools from Composio MCP server (cache TTL: {}s)",
         mcp_tools.len(),
-        server_id
+        mcp_config.tools_cache_ttl_secs
+    );
+    tracing::info!(
+        tool_count = mcp_tools.len(),
+        "Composio Pattern 1 detected: using direct app tools"
     );
 
-    // Convert to ZeroClaw tools
+    // Create onboarding handler based on UI mode
+    let onboarding: Option<Arc<dyn crate::composio::ComposioOnboarding>> = {
+        use crate::composio::{CliOnboarding, ComposioRestClient, OnboardingUx, ServerOnboarding};
+
+        // Create REST client for onboarding
+        let rest_client = Arc::new(ComposioRestClient::new(api_key.to_string()));
+
+        // Determine UI mode from environment
+        let ui_mode = std::env::var("ZEROCLAW_UI_MODE")
+            .unwrap_or_else(|_| "cli".to_string());
+
+        match ui_mode.as_str() {
+            "server" => Some(Arc::new(ServerOnboarding::new(rest_client))),
+            "cli" => {
+                // Check if browser auto-open is disabled
+                let no_browser = std::env::var("ZEROCLAW_NO_BROWSER")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+
+                let ux = if no_browser {
+                    OnboardingUx::CliPrintOnly
+                } else {
+                    OnboardingUx::CliAutoOpen
+                };
+
+                Some(Arc::new(CliOnboarding::new(rest_client, ux)))
+            }
+            _ => None,
+        }
+    };
+
+    // Convert to ZeroClaw tools with onboarding support
     let tools: Vec<Arc<dyn Tool>> = mcp_tools
         .into_iter()
         .map(|mcp_tool| {
-            Arc::new(ComposioMcpTool::new(
+            Arc::new(ComposioMcpTool::new_with_onboarding(
                 client.clone(),
                 mcp_tool,
                 security.clone(),
+                onboarding.clone(),
             )) as Arc<dyn Tool>
         })
         .collect();

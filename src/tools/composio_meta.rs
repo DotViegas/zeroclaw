@@ -360,6 +360,98 @@ impl ComposioMetaTool {
         
         Ok(tool_result)
     }
+    
+    /// Extract arguments from natural language query
+    /// This is a simple heuristic-based extraction for common patterns
+    fn extract_arguments_from_query(&self, query: &str, tool_slug: &str, schema: &Value) -> Value {
+        let query_lower = query.to_lowercase();
+        
+        // For Dropbox list folder operations
+        if tool_slug.contains("LIST") && tool_slug.contains("FOLDER") {
+            // Extract path from query
+            let path = if let Some(idx) = query_lower.find("folder") {
+                let after_folder = &query[idx + 6..].trim();
+                // Look for path patterns: /path, "/path", 'path'
+                if let Some(path_start) = after_folder.find('/') {
+                    let path_part = &after_folder[path_start..];
+                    // Extract until whitespace or end
+                    path_part.split_whitespace().next().unwrap_or("/").trim_matches(|c| c == '"' || c == '\'').to_string()
+                } else {
+                    // No explicit path - use root
+                    "".to_string()
+                }
+            } else {
+                // Default to root
+                "".to_string()
+            };
+            
+            return serde_json::json!({
+                "path": path,
+                "recursive": false,
+                "limit": 2000
+            });
+        }
+        
+        // For Gmail send operations
+        if tool_slug.contains("GMAIL") && tool_slug.contains("SEND") {
+            // Try to extract email, subject, body
+            let mut args = serde_json::Map::new();
+            
+            // Extract "to" email
+            if let Some(to_idx) = query_lower.find("to ") {
+                let after_to = &query[to_idx + 3..].trim();
+                if let Some(email) = after_to.split_whitespace().next() {
+                    if email.contains('@') {
+                        args.insert("to".to_string(), Value::String(email.to_string()));
+                    }
+                }
+            }
+            
+            // Extract subject
+            if let Some(subj_idx) = query_lower.find("subject") {
+                let after_subj = &query[subj_idx + 7..].trim();
+                if let Some(subject) = after_subj.split('"').nth(1).or_else(|| after_subj.split('\'').nth(1)) {
+                    args.insert("subject".to_string(), Value::String(subject.to_string()));
+                }
+            }
+            
+            if !args.is_empty() {
+                return Value::Object(args);
+            }
+        }
+        
+        // For GitHub operations
+        if tool_slug.contains("GITHUB") {
+            // Try to extract repo name
+            if let Some(repo_idx) = query_lower.find("repo") {
+                let after_repo = &query[repo_idx + 4..].trim();
+                if let Some(repo_name) = after_repo.split_whitespace().next() {
+                    return serde_json::json!({
+                        "repo": repo_name
+                    });
+                }
+            }
+        }
+        
+        // Check schema for simple default values
+        if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+            let mut args = serde_json::Map::new();
+            
+            for (key, prop) in props {
+                // Use default values from schema if available
+                if let Some(default) = prop.get("default") {
+                    args.insert(key.clone(), default.clone());
+                }
+            }
+            
+            if !args.is_empty() {
+                return Value::Object(args);
+            }
+        }
+        
+        // No arguments could be extracted
+        Value::Null
+    }
 }
 
 #[async_trait]
@@ -369,9 +461,12 @@ impl Tool for ComposioMetaTool {
     }
     
     fn description(&self) -> &str {
-        "Dynamic tool discovery and execution for 1000+ apps via Composio. \
-        Describe what you want to do (e.g., 'list my Dropbox folder', 'send Gmail email') \
-        and this tool will discover and execute the appropriate action."
+        "Access 1000+ apps (Dropbox, Gmail, GitHub, Slack, etc.) through Composio. \
+        Simply describe what you want to do in natural language. \
+        Examples: 'list my Dropbox folder /Documents', 'send email via Gmail to john@example.com', \
+        'create GitHub issue in my-repo'. \
+        The tool will automatically discover the right action and execute it. \
+        You can optionally provide specific arguments if you know the exact parameters needed."
     }
     
     fn parameters_schema(&self) -> Value {
@@ -455,21 +550,35 @@ impl Tool for ComposioMetaTool {
         let tool_args = if let Some(args) = provided_args {
             args
         } else {
-            // TODO: Could implement argument extraction from query here
-            // For now, return schema and ask user to provide arguments
-            return Ok(ToolResult {
-                success: false,
-                output: format!(
-                    "Tool found: {}\nDescription: {}\n\nRequired parameters:\n{}",
-                    tool.tool_slug,
-                    tool.description,
-                    serde_json::to_string_pretty(&schema)?
-                ),
-                error: Some(format!(
-                    "Please provide arguments for {}. Use the 'arguments' parameter.",
-                    tool.tool_slug
-                )),
-            });
+            // Try to extract simple arguments from the query
+            // For common patterns like "list folder /path" or "list folder"
+            let extracted_args = self.extract_arguments_from_query(query, &tool.tool_slug, &schema);
+            
+            if extracted_args.is_null() || extracted_args.as_object().map_or(true, |o| o.is_empty()) {
+                // No arguments could be extracted - return schema and guidance
+                return Ok(ToolResult {
+                    success: false,
+                    output: format!(
+                        "Tool found: {}\nDescription: {}\n\nRequired parameters:\n{}\n\n\
+                        Tip: You can call this tool again with the 'arguments' parameter, or I can help you construct the arguments.",
+                        tool.tool_slug,
+                        tool.description,
+                        serde_json::to_string_pretty(&schema)?
+                    ),
+                    error: Some(format!(
+                        "Missing required arguments for {}. Please provide the 'arguments' parameter with the required fields.",
+                        tool.tool_slug
+                    )),
+                });
+            }
+            
+            tracing::info!(
+                tool_slug = tool.tool_slug,
+                extracted_args = ?extracted_args,
+                "Extracted arguments from query"
+            );
+            
+            extracted_args
         };
         
         // 6. Ensure toolkit is connected

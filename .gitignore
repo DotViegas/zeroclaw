@@ -29,3 +29,7 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+
+# Temporary development files
+mover/
+cleanup-temp-docs.ps1

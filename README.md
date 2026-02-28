@@ -722,12 +722,26 @@ window_allowlist = []          # optional window title/process allowlist hints
 enabled = false                # opt-in: 1000+ OAuth apps via composio.dev
 # api_key = "cmp_..."          # optional: stored encrypted when [secrets].encrypt = true
 entity_id = "default"          # default user_id for Composio tool calls
-# Runtime tip: if execute asks for connected_account_id, run composio with
-# action='list_accounts' and app='gmail' (or your toolkit) to retrieve account IDs.
+
+# MCP (Model Context Protocol) configuration for Composio
+[composio.mcp]
+enabled = false                # enable MCP integration (recommended for 1000+ apps)
+# mcp_url = "https://..."      # generated MCP URL from Composio dashboard
+# server_id = "trs_..."        # Tool Router Session ID (alternative to mcp_url)
+# user_id = "..."              # MCP user ID (defaults to entity_id)
+# toolkits = []                # empty = all tools via meta-tools discovery
+tools_cache_ttl_secs = 600     # cache tools list for 10 minutes
+
+# When MCP is enabled, ZeroClaw uses the meta-tools pattern:
+# - composio_nl tool provides natural language access
+# - Automatic discovery via COMPOSIO_SEARCH_TOOLS
+# - OAuth handling via COMPOSIO_MANAGE_CONNECTIONS
+# - Execution via COMPOSIO_MULTI_EXECUTE_TOOL
 
 [identity]
 format = "openclaw"            # "openclaw" (default, markdown files) or "aieos" (JSON)
 # aieos_path = "identity.json"  # path to AIEOS JSON file (relative to workspace or absolute)
+
 # aieos_inline = '{"identity":{"names":{"first":"Nova"}}}'  # inline AIEOS JSON
 ```
 

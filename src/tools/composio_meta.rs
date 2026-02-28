@@ -1,5 +1,18 @@
 // Composio Meta-Tool Wrapper (Pattern 2)
 //
+// ⚠️ DEPRECATED: This module is deprecated in favor of `composio_nl.rs`
+//
+// The new `ComposioNaturalLanguageTool` in `composio_nl.rs` provides:
+// - Robust SSE parsing with incremental streaming support
+// - Better session management
+// - Cleaner error handling
+// - Direct integration with the new SSE client
+//
+// This module is kept for backward compatibility but will be removed in a future version.
+// Please use `ComposioNaturalLanguageTool` instead.
+//
+// ---
+//
 // This module implements dynamic tool discovery and execution using Composio's
 // meta-tools: COMPOSIO_SEARCH_TOOLS, COMPOSIO_MULTI_EXECUTE_TOOL, etc.
 //

@@ -2687,39 +2687,7 @@ pub async fn run(
         );
     }
 
-    // ── Tools (including memory tools and peripherals) ────────────
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-    let mut tools_registry = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    )
-    .await;
-
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    if !peripheral_tools.is_empty() {
-        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
-        tools_registry.extend(peripheral_tools);
-    }
-
-    // ── Resolve provider ─────────────────────────────────────────
+    // ── Resolve provider (needed for tool creation) ─────────────
     let provider_name = provider_override
         .as_deref()
         .or(config.default_provider.as_deref())
@@ -2746,6 +2714,41 @@ pub async fn run(
         model_name,
         &provider_runtime_options,
     )?;
+    
+    let provider_arc: Arc<dyn Provider> = Arc::from(provider);
+
+    // ── Tools (including memory tools and peripherals) ────────────
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        Some(provider_arc.clone()),
+    )
+    .await;
+
+    let peripheral_tools: Vec<Box<dyn Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    if !peripheral_tools.is_empty() {
+        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
+        tools_registry.extend(peripheral_tools);
+    }
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -2887,7 +2890,7 @@ pub async fn run(
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider_arc.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
@@ -2947,7 +2950,7 @@ pub async fn run(
         ];
 
         let response = run_tool_call_loop(
-            provider.as_ref(),
+            provider_arc.as_ref(),
             &mut history,
             &tools_registry,
             observer.as_ref(),
@@ -3068,7 +3071,7 @@ pub async fn run(
             history.push(ChatMessage::user(&enriched));
 
             let response = match run_tool_call_loop(
-                provider.as_ref(),
+                provider_arc.as_ref(),
                 &mut history,
                 &tools_registry,
                 observer.as_ref(),
@@ -3107,7 +3110,7 @@ pub async fn run(
             // Auto-compaction before hard trimming to preserve long-context signal.
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
-                provider.as_ref(),
+                provider_arc.as_ref(),
                 model_name,
                 config.agent.max_history_messages,
             )
@@ -3161,25 +3164,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    )
-    .await;
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    tools_registry.extend(peripheral_tools);
-
+    
+    // Create provider before tools (needed for Composio NL tool)
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
         .default_model
@@ -3200,6 +3186,28 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
         &provider_runtime_options,
     )?;
+    
+    let provider_arc: Arc<dyn Provider> = Arc::from(provider);
+    
+    let mut tools_registry = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        Some(provider_arc.clone()),
+    )
+    .await;
+    let peripheral_tools: Vec<Box<dyn Tool>> =
+        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
+    tools_registry.extend(peripheral_tools);
 
     let hardware_rag: Option<crate::rag::HardwareRag> = config
         .peripherals
@@ -3269,7 +3277,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider_arc.supports_native_tools();
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         &model_name,
@@ -3303,7 +3311,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     ];
 
     agent_turn(
-        provider.as_ref(),
+        provider_arc.as_ref(),
         &mut history,
         &tools_registry,
         observer.as_ref(),

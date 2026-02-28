@@ -5,6 +5,9 @@
 //
 // Architecture:
 // ZeroClaw (Rust) → HTTP → Composio MCP Server (Cloud) → Gmail/Dropbox/GitHub/etc.
+//
+// Note: This client uses a simple SSE parser. For more robust SSE handling with
+// incremental parsing, see `sse_client::McpClient`.
 
 use anyhow::Context;
 use reqwest::Client;
@@ -14,7 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 const COMPOSIO_MCP_BASE_URL: &str = "https://backend.composio.dev/tool_router";
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_TIMEOUT_SECS: u64 = 180;  // Increased from 60 to 180 seconds
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// Parse Server-Sent Events (SSE) response format
@@ -24,13 +27,25 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// event: message
 /// data: {"jsonrpc":"2.0","result":{...},"id":1}
 /// ```
+///
+/// This is a simple parser that extracts the last JSON payload.
+/// For more robust incremental SSE parsing, use `sse_client::McpClient`.
 fn parse_sse_response(text: &str) -> anyhow::Result<String> {
-    // Find the "data: " line
+    let mut last_json: Option<String> = None;
+    
+    // Parse all data: lines and keep the last one
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(json) = trimmed.strip_prefix("data:").or_else(|| trimmed.strip_prefix("data: ")) {
-            return Ok(json.trim().to_string());
+            let json = json.trim();
+            if !json.is_empty() && json != "[DONE]" {
+                last_json = Some(json.to_string());
+            }
         }
+    }
+    
+    if let Some(json) = last_json {
+        return Ok(json);
     }
     
     // If no SSE format found, try to parse as direct JSON
@@ -249,19 +264,48 @@ impl ComposioMcpClient {
             }
         });
 
+        tracing::info!(
+            tool_name = tool_name,
+            arguments = ?arguments,
+            mcp_url = %self.mcp_url,
+            "Sending MCP tool execution request"
+        );
+
         let response = self
             .client
             .post(&self.mcp_url)
             .header("x-api-key", &self.api_key)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
+            .header("Accept", "text/event-stream, application/json")  // Accept both SSE and JSON
             .json(&request_body)
             .send()
             .await
             .context("Failed to send MCP tool execution request")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        // CRITICAL: Log headers IMMEDIATELY (before reading body)
+        let status = response.status();
+        let content_type = response.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        let transfer_encoding = response.headers()
+            .get("transfer-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("none");
+        let content_length = response.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        
+        tracing::info!(
+            status = %status,
+            content_type = content_type,
+            transfer_encoding = transfer_encoding,
+            content_length = content_length,
+            "Received MCP response headers (BEFORE reading body)"
+        );
+
+        if !status.is_success() {
             let error_text = response
                 .text()
                 .await
@@ -269,10 +313,31 @@ impl ComposioMcpClient {
             anyhow::bail!("MCP tool execution failed ({}): {}", status, error_text);
         }
 
+        // Check if response is SSE
+        let is_sse = content_type.contains("text/event-stream");
+        
+        if is_sse {
+            tracing::info!("Response is SSE, reading as stream");
+        } else {
+            tracing::info!("Response is JSON, reading as text");
+        }
+
         let response_text = response
             .text()
             .await
             .context("Failed to read MCP response")?;
+        
+        // DEBUG: Log first 1000 chars of response
+        let preview = if response_text.len() > 1000 {
+            format!("{}... (total {} bytes)", &response_text[..1000], response_text.len())
+        } else {
+            response_text.clone()
+        };
+        tracing::info!(
+            response_length = response_text.len(),
+            response_preview = preview,
+            "MCP response body received"
+        );
 
         // Parse SSE response
         let json_data = parse_sse_response(&response_text)?;

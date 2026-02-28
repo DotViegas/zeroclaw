@@ -431,7 +431,7 @@ impl Tool for ComposioTool {
          \n• action='list_accounts' [app='dropbox'] - Verify active connections (alias: connected_accounts)\
          \n• action='execute' action_name='TOOL_NAME' params={} - Run tool action\
          \n\n⚠️ TROUBLESHOOTING:\
-         \n• If connect fails: App may need configuration in Composio dashboard (https://app.composio.dev/apps)\
+         \n• If connect fails: App may need OAuth authorization - use action='connect' to get link\
          \n• If execute fails with 401/403: Re-authorize (connection expired/revoked)\
          \n• Connection links expire in 10 minutes - generate new link if expired"
     }
@@ -770,8 +770,7 @@ impl Tool for ComposioTool {
                                 "Failed to generate connection link: {e}\
                                  \n\nTroubleshooting:\
                                  \n- Verify the app name is correct (e.g., 'dropbox', 'gmail', 'github')\
-                                 \n- Check that you have configured this app in Composio dashboard\
-                                 \n- Visit https://app.composio.dev/apps to set up integrations"
+                                 \n- Use action='connect' app='app_name' to get OAuth authorization link"
                             )
                         };
                         Ok(ToolResult {

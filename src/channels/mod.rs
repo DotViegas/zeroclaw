@@ -2247,7 +2247,79 @@ pub fn build_system_prompt_with_mode(
         prompt.push('\n');
     }
 
-    // ── 1b. Hardware (when gpio/arduino tools present) ───────────
+    // ── 1b. Composio (when composio_nl tool present) ─────────────
+    let has_composio = tools.iter().any(|(name, _)| *name == "composio_nl");
+    if has_composio {
+        prompt.push_str(
+            "## Composio Meta-Tools Protocol\n\n\
+             You have access to Composio meta-tools for external apps/services. Follow this MANDATORY workflow:\n\n\
+             ### Step A: Discover Tools (REQUIRED FIRST)\n\
+             Always call COMPOSIO_SEARCH_TOOLS first:\n\
+             - queries: [{ use_case: \"<describe task in English>\", known_fields: \"<useful keys if known>\" }]\n\
+             - session: { generate_id: true }\n\
+             Save the returned session_id for all subsequent calls.\n\n\
+             ### Step B: Load Schemas (IF NEEDED)\n\
+             If tools have schemaRef or incomplete schema, call COMPOSIO_GET_TOOL_SCHEMAS:\n\
+             - tool_slugs: [\"TOOL_NAME_1\", \"TOOL_NAME_2\"]\n\
+             - session_id: \"<session_id_from_step_a>\"\n\
+             Never invent parameters.\n\n\
+             ### Step C: Authenticate (IF NEEDED)\n\
+             Before executing any external toolkit tool, call COMPOSIO_MANAGE_CONNECTIONS:\n\
+             - toolkits: [\"<exact_toolkit_name_from_search>\"]\n\
+             - session_id: \"<session_id_from_step_a>\"\n\
+             CRITICAL: You MUST call this to get the real OAuth link. NEVER invent OAuth URLs.\n\
+             If status != \"ACTIVE\", extract redirect_url from response and show as clickable Markdown link.\n\
+             For explicit connection requests (\"connect to Slack\"), proceed after showing link.\n\
+             For implicit usage (\"list my emails\"), wait for user to authorize first.\n\n\
+             ### Step D: Execute\n\
+             Use COMPOSIO_MULTI_EXECUTE_TOOL with strict schema compliance:\n\
+             - tools: [{ tool_slug: \"...\", arguments: {...} }]\n\
+             - session_id: \"<session_id_from_step_a>\"\n\
+             - current_step: \"<descriptive_step_name>\" (optional but recommended)\n\
+             - current_step_metric: \"<progress>\" (optional)\n\n\
+             ### Gmail Search Operators (for arguments.query):\n\
+             - from:email@example.com - From sender\n\
+             - to:email@example.com - To recipient\n\
+             - subject:keyword - Subject contains\n\
+             - after:2024/01/01 - After date\n\
+             - before:2024/12/31 - Before date\n\
+             - has:attachment - Has attachments\n\
+             - is:unread - Unread only\n\
+             - is:starred - Starred only\n\
+             - in:inbox - In folder\n\n\
+             ### Critical Rules:\n\
+             1. NEVER skip Step A (COMPOSIO_SEARCH_TOOLS) - always discover tools first\n\
+             2. NEVER invent parameters - get schema via COMPOSIO_GET_TOOL_SCHEMAS if needed\n\
+             3. NEVER execute without checking connection - call COMPOSIO_MANAGE_CONNECTIONS first\n\
+             4. NEVER invent OAuth URLs - use redirect_url from COMPOSIO_MANAGE_CONNECTIONS response\n\
+             5. ALWAYS use session_id (not session object) in Steps B/C/D\n\
+             6. ALWAYS use exact toolkit names returned by COMPOSIO_SEARCH_TOOLS\n\
+             7. For pagination (cursor/next_page_token), iterate until complete\n\
+             8. Warn user before destructive actions (delete, overwrite)\n\
+             9. Use COMPOSIO_REMOTE_WORKBENCH only for bulk operations (100+ items)\n\n\
+             ### Example: Connecting to Slack\n\
+             User: \"Conectar ao meu Slack\"\n\n\
+             ❌ WRONG (inventing URL):\n\
+             \"Clique aqui: https://app.composio.dev/app-store/slack\"\n\n\
+             ✅ CORRECT workflow:\n\
+             1. Call COMPOSIO_SEARCH_TOOLS with queries: [{use_case: \"connect to slack\"}], session: {generate_id: true}\n\
+             2. Receive session_id: \"abc123\" and toolkit: \"slack\"\n\
+             3. Call COMPOSIO_MANAGE_CONNECTIONS with toolkits: [\"slack\"], session_id: \"abc123\"\n\
+             4. Receive response: {status: \"DISCONNECTED\", redirect_url: \"https://backend.composio.dev/oauth/...\"}\n\
+             5. Show: \"[Clique aqui para autorizar o Slack](https://backend.composio.dev/oauth/...)\"\n\n\
+             ### CRITICAL OAuth Rules:\n\
+             - ALWAYS copy and paste the COMPLETE OAuth link from tool output - NEVER replace it with placeholders\n\
+             - NEVER write [OAuth URL], [link], or any placeholder - show the ACTUAL https:// link\n\
+             - NEVER suggest visiting the Composio dashboard (app.composio.dev) to connect\n\
+             - NEVER say \"configure in dashboard\" or \"set up in Composio dashboard\"\n\
+             - The OAuth link comes from the tool response - copy it EXACTLY as shown\n\
+             - Example: If tool says \"https://connect.composio.dev/link/lk_abc123\", show that EXACT link\n\n\
+             ### Response Format:\n\
+             Present results in natural language, NOT raw JSON. You may use emojis for clarity but it's optional.\n\n",
+        );
+    }
+
+    // ── 1c. Hardware (when gpio/arduino tools present) ───────────
     let has_hardware = tools.iter().any(|(name, _)| {
         *name == "gpio_read"
             || *name == "gpio_write"
@@ -2268,7 +2340,7 @@ pub fn build_system_prompt_with_mode(
         );
     }
 
-    // ── 1c. Action instruction (avoid meta-summary) ───────────────
+    // ── 1d. Action instruction (avoid meta-summary) ───────────────
     if native_tools {
         prompt.push_str(
             "## Your Task\n\n\
@@ -3067,6 +3139,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             &config.agents,
             config.api_key.as_deref(),
             &config,
+            None, // Channels don't have provider yet
         )
         .await,
     );

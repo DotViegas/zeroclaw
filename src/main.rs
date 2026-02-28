@@ -55,6 +55,7 @@ mod channels;
 mod composio {
     pub use zeroclaw::composio::*;
 }
+mod composio_diagnostic;
 mod rag {
     pub use zeroclaw::rag::*;
 }
@@ -81,7 +82,7 @@ mod onboard;
 mod peripherals;
 mod providers;
 mod runtime;
-mod security;
+pub(crate) mod security;
 mod service;
 mod skillforge;
 mod skills;
@@ -699,6 +700,22 @@ enum ComposioCommands {
         yes: bool,
     },
     
+    /// Run comprehensive diagnostics for Composio MCP integration
+    #[command(long_about = "\
+Run comprehensive diagnostics for Composio MCP integration.
+
+Tests MCP connection, tool discovery, OAuth flow, and common use cases.
+Provides detailed output to help troubleshoot integration issues.
+
+Examples:
+  zeroclaw composio diagnostic-connect
+  zeroclaw composio diagnostic-connect --verbose")]
+    DiagnosticConnect {
+        /// Show detailed diagnostic information
+        #[arg(long)]
+        verbose: bool,
+    },
+    
     /// List available toolkits from Composio
     ListToolkits {
         /// Show only connected toolkits
@@ -745,9 +762,9 @@ enum ComposioCommands {
         #[arg(long)]
         force: bool,
         
-        /// Update config file with new MCP URL
+        /// Skip saving to config file (just display the URL)
         #[arg(long)]
-        save: bool,
+        no_save: bool,
     },
     
     /// Test a Composio MCP tool
@@ -1458,12 +1475,17 @@ async fn handle_composio_command(command: ComposioCommands, config: &Config) -> 
             handle_composio_list_tools(config, toolkit.as_deref(), schema).await
         }
         
-        ComposioCommands::Refresh { force, save } => {
-            handle_composio_refresh(config, force, save).await
+        ComposioCommands::Refresh { force, no_save } => {
+            handle_composio_refresh(config, force, !no_save).await
         }
         
         ComposioCommands::Test { tool, args, verbose } => {
             handle_composio_test(config, &tool, args.as_deref(), verbose).await
+        }
+        
+        ComposioCommands::DiagnosticConnect { verbose } => {
+            composio_diagnostic::run_diagnostic(config, verbose).await?;
+            Ok(())
         }
     }
 }
@@ -1562,7 +1584,7 @@ async fn handle_composio_connect(
             eprintln!("  1. Make sure you completed the OAuth flow in your browser");
             eprintln!("  2. Check that you authorized the correct account");
             eprintln!("  3. Try again with a longer timeout: --timeout 300");
-            eprintln!("  4. Check your Composio dashboard: https://app.composio.dev");
+            eprintln!("  4. Verify your Composio API key is valid");
             std::process::exit(1);
         }
     }
@@ -1852,18 +1874,19 @@ async fn handle_composio_refresh(
         return Ok(());
     }
     
-    // Get toolkits
-    let toolkits = &config.composio.mcp.toolkits;
-    if toolkits.is_empty() {
-        bail!("No toolkits configured. Run 'zeroclaw onboard' to add toolkits.");
-    }
-    
     // Get user ID
     let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
     
+    // Get toolkits (optional - if empty, all tools are available via meta-tool)
+    let toolkits = &config.composio.mcp.toolkits;
+    
     println!("🔄 Generating new MCP URL...");
     println!("  User ID: {}", user_id);
-    println!("  Toolkits: {}", toolkits.join(", "));
+    if toolkits.is_empty() {
+        println!("  Mode: All tools (meta-tool discovery)");
+    } else {
+        println!("  Toolkits: {}", toolkits.join(", "));
+    }
     println!();
     
     // Create blocking client
@@ -1872,31 +1895,53 @@ async fn handle_composio_refresh(
     // Generate MCP URL
     let mcp_url = if user_id.starts_with("trs_") {
         // Tool Router Session - construct URL directly
-        let toolkits_param = toolkits.join(",");
-        format!(
-            "https://backend.composio.dev/tool_router/{}/mcp?include_composio_helper_actions=true&user_id={}&toolkits={}",
-            user_id, user_id, toolkits_param
-        )
+        // If no toolkits specified, omit the parameter to get all tools
+        if toolkits.is_empty() {
+            format!(
+                "https://backend.composio.dev/tool_router/{}/mcp?include_composio_helper_actions=true&user_id={}",
+                user_id, user_id
+            )
+        } else {
+            let toolkits_param = toolkits.join(",");
+            format!(
+                "https://backend.composio.dev/tool_router/{}/mcp?include_composio_helper_actions=true&user_id={}&toolkits={}",
+                user_id, user_id, toolkits_param
+            )
+        }
     } else {
         // Regular user ID - use API
-        client.generate_mcp_url(toolkits.clone(), &user_id)?
+        if toolkits.is_empty() {
+            // Generate URL for all tools
+            client.generate_mcp_url(vec![], &user_id)?
+        } else {
+            client.generate_mcp_url(toolkits.clone(), &user_id)?
+        }
     };
     
     println!("✓ MCP URL generated successfully\n");
-    println!("New MCP URL:");
-    println!("  {}\n", mcp_url);
     
     if save {
-        println!("⚠️  Automatic config saving is not yet implemented");
-        println!("\nTo update your configuration manually:");
-        println!("  1. Edit your config.toml file");
-        println!("  2. Update [composio.mcp].mcp_url with the URL above");
-        println!("  3. Restart your agent or gateway");
+        // Update config and save
+        let mut updated_config = config.clone();
+        updated_config.composio.mcp.mcp_url = Some(mcp_url.clone());
+        
+        updated_config.save().await.context("Failed to save config")?;
+        
+        println!("✓ Configuration updated successfully");
+        println!("\nNew MCP URL:");
+        println!("  {}", mcp_url);
+        println!("\nSaved to: {}", config.config_path.display());
+        println!("\nYou can now use Composio tools via the meta-tool approach:");
+        println!("  zeroclaw agent");
+        println!("  Then: \"Use COMPOSIO_SEARCH_TOOLS to find tools for [your task]\"");
     } else {
+        println!("New MCP URL:");
+        println!("  {}\n", mcp_url);
         println!("To save this URL to your configuration:");
-        println!("  1. Edit your config.toml file");
+        println!("  Run: zeroclaw composio refresh --force");
+        println!("\nOr update manually:");
+        println!("  1. Edit: {}", config.config_path.display());
         println!("  2. Update [composio.mcp].mcp_url with the URL above");
-        println!("  3. Or run: zeroclaw composio refresh --save (when implemented)");
     }
     
     Ok(())

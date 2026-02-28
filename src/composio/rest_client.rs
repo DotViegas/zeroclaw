@@ -72,9 +72,16 @@ impl ComposioRestClient {
 
         let url = format!("{COMPOSIO_API_BASE_V3}/connected_accounts/link");
         let body = json!({
-            "auth_config_id": auth_config_id,
-            "user_id": entity_id,
+            "authConfigId": auth_config_id,
+            "userId": entity_id,
         });
+
+        tracing::debug!(
+            url = %url,
+            auth_config_id = %auth_config_id,
+            user_id = %entity_id,
+            "Sending Composio v3 connect request"
+        );
 
         let resp = self
             .client
@@ -84,7 +91,13 @@ impl ComposioRestClient {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
+        let status = resp.status();
+        tracing::debug!(
+            status = %status,
+            "Received Composio v3 connect response"
+        );
+
+        if !status.is_success() {
             let err = response_error(resp).await;
             anyhow::bail!("Composio v3 connect failed: {err}");
         }
@@ -93,8 +106,27 @@ impl ComposioRestClient {
             .json()
             .await
             .context("Failed to decode Composio v3 connect response")?;
+        
+        // Debug log to see the actual response
+        tracing::debug!(
+            response = ?result,
+            "Composio v3 connect response received"
+        );
+        
         let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v3 response"))?;
+            .ok_or_else(|| {
+                tracing::error!(
+                    response = ?result,
+                    "Failed to extract redirect URL from Composio v3 response"
+                );
+                anyhow::anyhow!("No redirect URL in Composio v3 response: {:?}", result)
+            })?;
+        
+        tracing::info!(
+            redirect_url = %redirect_url,
+            "Successfully extracted redirect URL from Composio v3"
+        );
+        
         Ok(ComposioConnectionLink {
             redirect_url,
             connected_account_id: extract_connected_account_id(&result),
@@ -167,11 +199,8 @@ impl ComposioRestClient {
         if body.items.is_empty() {
             anyhow::bail!(
                 "No authentication configuration found for app '{app_name}'. \
-                 \nTo fix this:\
-                 \n1. Visit https://app.composio.dev/apps and search for '{app_name}'\
-                 \n2. Click 'Add Integration' or 'Configure' for {app_name}\
-                 \n3. Follow the setup wizard to create an auth config\
-                 \n4. Once created, retry action='connect' with app='{app_name}'"
+                 \nThis usually means the app needs to be set up in your Composio account first.\
+                 \nPlease contact support or check the Composio documentation for setup instructions."
             );
         }
 
@@ -270,17 +299,41 @@ fn normalize_app_slug(app_name: &str) -> String {
 }
 
 fn extract_redirect_url(result: &serde_json::Value) -> Option<String> {
-    result
-        .get("redirect_url")
+    // Try all possible field names and locations
+    let url = result
+        .get("redirectUrl")
         .and_then(|v| v.as_str())
-        .or_else(|| result.get("redirectUrl").and_then(|v| v.as_str()))
+        .or_else(|| result.get("redirect_url").and_then(|v| v.as_str()))
+        .or_else(|| result.get("url").and_then(|v| v.as_str()))
+        .or_else(|| result.get("link").and_then(|v| v.as_str()))
+        .or_else(|| {
+            result
+                .get("data")
+                .and_then(|v| v.get("redirectUrl"))
+                .and_then(|v| v.as_str())
+        })
         .or_else(|| {
             result
                 .get("data")
                 .and_then(|v| v.get("redirect_url"))
                 .and_then(|v| v.as_str())
         })
-        .map(ToString::to_string)
+        .or_else(|| {
+            result
+                .get("data")
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str())
+        })
+        .map(ToString::to_string);
+    
+    if url.is_none() {
+        tracing::warn!(
+            response_keys = ?result.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+            "Could not find redirect URL in response. Available keys logged."
+        );
+    }
+    
+    url
 }
 
 fn extract_connected_account_id(result: &serde_json::Value) -> Option<String> {

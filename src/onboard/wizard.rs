@@ -37,6 +37,7 @@ pub struct ProjectContext {
     pub timezone: String,
     pub agent_name: String,
     pub communication_style: String,
+    pub composio_mcp_enabled: bool,
 }
 
 // ── Banner ───────────────────────────────────────────────────────
@@ -117,7 +118,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     let memory_config = setup_memory()?;
 
     print_step(8, 9, "Project Context (Personalize Your Agent)");
-    let project_ctx = setup_project_context()?;
+    let mut project_ctx = setup_project_context()?;
+    project_ctx.composio_mcp_enabled = composio_config.mcp.enabled;
 
     print_step(9, 9, "Workspace Files");
     scaffold_workspace(&workspace_dir, &project_ctx).await?;
@@ -142,7 +144,15 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
-        agent: crate::config::schema::AgentConfig::default(),
+        agent: {
+            let mut agent_config = crate::config::schema::AgentConfig::default();
+            // If Composio MCP is enabled, increase max_tool_iterations to 50
+            // to support multi-step workflows (search → get_schemas → execute, etc.)
+            if composio_config.mcp.enabled {
+                agent_config.max_tool_iterations = 50;
+            }
+            agent_config
+        },
         skills: crate::config::SkillsConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
@@ -529,6 +539,7 @@ async fn run_quick_setup_with_home(
         communication_style:
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
+        composio_mcp_enabled: false, // Default to false for quick setup
     };
     scaffold_workspace(&workspace_dir, &default_ctx).await?;
 
@@ -2698,7 +2709,7 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
         .default(0)
         .interact()?;
 
-    let mut composio_config = if choice == 1 {
+    let composio_config = if choice == 1 {
         println!();
         println!(
             "  {} {}",
@@ -2745,114 +2756,78 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
 
             let mcp_config = if use_mcp {
                 println!();
-                print_bullet("Select toolkits to enable (you can add more later):");
-                println!();
-
-                // Toolkit selection
-                let available_toolkits = vec![
-                    ("gmail", "Gmail - Email management"),
-                    ("github", "GitHub - Repository management"),
-                    ("slack", "Slack - Team communication"),
-                    ("dropbox", "Dropbox - File storage"),
-                    ("notion", "Notion - Note-taking & docs"),
-                    ("calendar", "Google Calendar - Scheduling"),
-                ];
-
-                let mut selected_toolkits = Vec::new();
                 
-                for (slug, description) in &available_toolkits {
-                    let enable = Confirm::new()
-                        .with_prompt(format!("    Enable {}?", description))
-                        .default(false)
-                        .interact()?;
-                    
-                    if enable {
-                        selected_toolkits.push(slug.to_string());
-                    }
-                }
+                // Get user ID directly (no toolkit selection)
+                let user_id: String = Input::new()
+                    .with_prompt("  MCP User ID (default: 'default')")
+                    .default("default".to_string())
+                    .interact_text()?;
 
-                if selected_toolkits.is_empty() {
-                    println!();
-                    print_bullet("No toolkits selected. You can configure them later in config.toml");
-                    println!(
-                        "  {} MCP: {} — configure toolkits later",
-                        style("→").dim(),
-                        style("skipped").dim()
-                    );
-                    ComposioMcpConfig::default()
+                println!();
+                
+                // Get MCP-specific API key
+                println!("  {} MCP requires a separate API key from the Tool Router Session", style("ℹ").cyan());
+                print_bullet("Get it from: https://app.composio.dev/mcp (after creating session)");
+                print_bullet("It starts with 'ak_' and is different from your main Composio API key");
+                println!();
+                
+                let mcp_api_key: String = Input::new()
+                    .with_prompt("  MCP API Key (or press Enter to use main Composio key)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                
+                let mcp_api_key = if mcp_api_key.trim().is_empty() {
+                    None
                 } else {
-                    // Get user ID
-                    let user_id: String = Input::new()
-                        .with_prompt("  MCP User ID (default: 'default')")
-                        .default("default".to_string())
-                        .interact_text()?;
+                    Some(mcp_api_key.trim().to_string())
+                };
 
-                    // Generate MCP URL
-                    println!();
-                    println!("  {} Generating MCP URL...", style("⚙").cyan());
-                    
-                    match generate_mcp_url_blocking(&api_key, selected_toolkits.clone(), &user_id) {
-                        Ok(mcp_url) => {
+                println!();
+                print_bullet("No toolkits selected - all tools available via meta-tool discovery");
+                print_bullet("Use composio_nl tool to access 1000+ apps with natural language");
+
+                // Generate MCP URL with empty toolkits
+                println!();
+                println!("  {} Generating MCP URL...", style("⚙").cyan());
+                
+                match generate_mcp_url_blocking(&api_key, vec![], &user_id) {
+                    Ok(mcp_url) => {
+                        println!(
+                            "  {} MCP URL generated successfully",
+                            style("✓").green().bold()
+                        );
+                        
+                        if mcp_api_key.is_some() {
                             println!(
-                                "  {} MCP URL generated successfully",
-                                style("✓").green().bold()
+                                "  {} MCP: {} — using MCP-specific API key",
+                                style("✓").green().bold(),
+                                style("enabled").green()
                             );
-                            
-                            // Ask if user wants to connect a toolkit now
-                            println!();
-                            let connect_now = Confirm::new()
-                                .with_prompt("  Connect a toolkit now? (recommended)")
-                                .default(true)
-                                .interact()?;
-
-                            if connect_now && !selected_toolkits.is_empty() {
-                                // Let user pick which toolkit to connect
-                                let toolkit_names: Vec<&str> = selected_toolkits.iter().map(|s| s.as_str()).collect();
-                                let toolkit_idx = Select::new()
-                                    .with_prompt("  Which toolkit to connect?")
-                                    .items(&toolkit_names)
-                                    .default(0)
-                                    .interact()?;
-
-                                let toolkit = &selected_toolkits[toolkit_idx];
-                                
-                                match connect_toolkit_blocking(&api_key, toolkit, &user_id) {
-                                    Ok(()) => {
-                                        println!(
-                                            "  {} {} connected successfully!",
-                                            style("✓").green().bold(),
-                                            toolkit.to_uppercase()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        println!(
-                                            "  {} Failed to connect {}: {}",
-                                            style("⚠").yellow(),
-                                            toolkit,
-                                            e
-                                        );
-                                        print_bullet("You can connect it later using the agent");
-                                    }
-                                }
-                            }
-
-                            ComposioMcpConfig {
-                                enabled: true,
-                                mcp_url: Some(mcp_url),
-                                user_id: Some(user_id),
-                                toolkits: selected_toolkits,
-                                ..ComposioMcpConfig::default()
-                            }
-                        }
-                        Err(e) => {
+                        } else {
                             println!(
-                                "  {} Failed to generate MCP URL: {}",
+                                "  {} MCP: {} — using main Composio API key (may cause auth issues)",
                                 style("⚠").yellow(),
-                                e
+                                style("enabled").yellow()
                             );
-                            print_bullet("You can configure MCP manually later in config.toml");
-                            ComposioMcpConfig::default()
                         }
+
+                        ComposioMcpConfig {
+                            enabled: true,
+                            api_key: mcp_api_key,
+                            mcp_url: Some(mcp_url),
+                            user_id: Some(user_id),
+                            toolkits: vec![], // Empty for meta-tool discovery
+                            ..ComposioMcpConfig::default()
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "  {} Failed to generate MCP URL: {}",
+                            style("⚠").yellow(),
+                            e
+                        );
+                        print_bullet("You can configure MCP manually later in config.toml");
+                        ComposioMcpConfig::default()
                     }
                 }
             } else {
@@ -3192,6 +3167,7 @@ fn setup_project_context() -> Result<ProjectContext> {
         timezone,
         agent_name,
         communication_style,
+        composio_mcp_enabled: false, // Will be set by caller
     })
 }
 
@@ -5162,6 +5138,15 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         &ctx.communication_style
     };
 
+    // Tool priority instructions (conditional based on MCP)
+    let tool_priority_instructions = if ctx.composio_mcp_enabled {
+        "2. Use `composio_nl` tool with natural language query\n\
+         3. Handle OAuth if needed, then retry"
+    } else {
+        "2. Use `composio` tool with action='list' to check if app is available\n\
+         3. Follow the SEARCH → CONNECT → EXECUTE → PROCESS pattern"
+    };
+
     let identity = format!(
         "# IDENTITY.md — Who Am I?\n\n\
          - **Name:** {agent}\n\
@@ -5208,8 +5193,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ## Tool Priority (CRITICAL)\n\n\
          When the user asks to interact with cloud services:\n\n\
          1. **CHECK COMPOSIO FIRST** — Read `COMPOSIO_ORCHESTRATION.md` for the workflow\n\
-         2. Use `composio` tool with action='list' to check if app is available\n\
-         3. Follow the SEARCH → CONNECT → EXECUTE → PROCESS pattern\n\
+         {tool_priority_instructions}\n\
          4. Only suggest manual alternatives if Composio doesn't support the app\n\n\
          Examples of Composio-first scenarios:\n\
          - \"Access my Dropbox\" → Use Composio, not manual API\n\
@@ -5390,7 +5374,82 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ## Open Loops\n\
          (Track unfinished tasks and follow-ups here)\n";
 
-    let composio = "\
+    // Generate Composio instructions based on MCP configuration
+    let composio = if ctx.composio_mcp_enabled {
+        // MCP-enabled: use composio_nl with meta-tools
+        "\
+         # COMPOSIO.md — Your Gateway to 1000+ Apps via MCP\n\n\
+         Composio gives you access to Gmail, Dropbox, Notion, GitHub, Slack, and 1000+ other apps through OAuth.\n\n\
+         ## ⚠️ CRITICAL: Which Tool to Use\n\n\
+         **ALWAYS use this tool:**\n\
+         - ✅ `composio_nl` - Natural language access to 1000+ apps via meta-tools\n\n\
+         **NEVER use:**\n\
+         - ❌ `composio` (lowercase) with `action='list'` or `action='execute'`\n\
+         - ❌ `composio_dynamic` (deprecated, doesn't exist)\n\n\
+         ## 🚀 How to Use composio_nl\n\n\
+         Simply describe what you want to do in natural language!\n\n\
+         ### Example 1: List Gmail Emails\n\
+         ```\n\
+         composio_nl with query=\"list my gmail emails\"\n\
+         ```\n\n\
+         ### Example 2: Create Dropbox Folder\n\
+         ```\n\
+         composio_nl with query=\"create folder called Documents in Dropbox\"\n\
+         ```\n\n\
+         ### Example 3: Send Slack Message\n\
+         ```\n\
+         composio_nl with query=\"send slack message to #general: Hello team!\"\n\
+         ```\n\n\
+         ### Example 4: Search GitHub Issues\n\
+         ```\n\
+         composio_nl with query=\"search github issues in my-repo\"\n\
+         ```\n\n\
+         ## 🔄 How It Works (Meta-Tools Pattern)\n\n\
+         Behind the scenes, `composio_nl` uses Composio's meta-tools workflow:\n\n\
+         1. **COMPOSIO_SEARCH_TOOLS** - Discovers relevant tools for your query\n\
+         2. **COMPOSIO_MANAGE_CONNECTIONS** - Handles OAuth authentication if needed\n\
+         3. **COMPOSIO_MULTI_EXECUTE_TOOL** - Executes the discovered tool\n\n\
+         You don't need to worry about these details - just use natural language!\n\n\
+         ## 🔐 Authentication Flow\n\n\
+         If authentication is needed:\n\
+         1. Tool will provide OAuth URL\n\
+         2. Present URL to user: \"Please authorize at: [URL]\"\n\
+         3. User clicks link and authorizes\n\
+         4. Automatically retry the same query\n\n\
+         **Example OAuth Response:**\n\
+         ```\n\
+         OAuth authorization required for GMAIL.\n\n\
+         Please click this link to authorize:\n\
+         https://backend.composio.dev/oauth/...\n\n\
+         After authorizing, please retry your request.\n\
+         The authorization link expires in 10 minutes.\n\
+         ```\n\n\
+         ## 🔧 MCP Configuration\n\n\
+         **Important**: Use your general Composio API key (not MCP-specific).\n\
+         - Get it from: https://app.composio.dev/settings\n\
+         - It starts with `ak_` and works for both direct and MCP access\n\
+         - Configured in `config.toml` under `[composio]` section\n\n\
+         If you see errors:\n\
+         1. Verify API key is correct in config.toml\n\
+         2. Check that MCP URL matches your session ID\n\
+         3. Ensure you're using `composio_nl` (not `composio_dynamic`)\n\n\
+         ## ✅ Success Checklist\n\n\
+         □ Using `composio_nl` (not `composio` or `composio_dynamic`)?\n\
+         □ Using natural language query?\n\
+         □ Executing proactively without asking permission?\n\
+         □ Handling OAuth automatically (show link, then retry)?\n\
+         □ Summarizing results in natural language?\n\n\
+         ## 🎯 Best Practices\n\n\
+         1. **Be specific**: Include app name in query (\"gmail\", \"dropbox\", \"slack\")\n\
+         2. **Be clear**: Describe the action clearly (\"list\", \"create\", \"send\")\n\
+         3. **Be proactive**: Execute immediately, don't ask for permission\n\
+         4. **Handle OAuth**: Show link, wait for user, then retry automatically\n\
+         5. **Summarize**: Present results in natural, readable format\n\n\
+         ---\n\n\
+         **Remember: Use composio_nl with natural language. The tool handles discovery, auth, and execution automatically.**\n"
+    } else {
+        // Direct tool: use composio with action parameter
+        "\
          # COMPOSIO.md — Your Gateway to 1000+ Apps\n\n\
          Composio gives you access to Gmail, Dropbox, Notion, GitHub, Slack, and 1000+ other apps through OAuth.\n\n\
          ## 🚀 Two Ways to Use Composio\n\n\
@@ -5441,12 +5500,11 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ```\n\n\
          ## ⚠️ Common Issues & Solutions\n\n\
          ### \"No authentication configuration found\"\n\
-         **Problem:** App not configured in Composio dashboard\n\
-         **Solution:** Tell user to:\n\
-         1. Visit https://app.composio.dev/apps\n\
-         2. Search for the app (e.g., \"dropbox\")\n\
-         3. Click \"Add Integration\" and follow setup wizard\n\
-         4. Come back and retry action='connect'\n\n\
+         **Problem:** App not configured in Composio\n\
+         **Solution:** The OAuth link should be automatically generated. If it fails:\n\
+         1. Verify the app name is correct (e.g., 'gmail', 'dropbox', 'slack')\n\
+         2. Check your Composio API key is valid\n\
+         3. Retry action='connect' to get a fresh OAuth link\n\n\
          ### \"401/403 error when executing\"\n\
          **Problem:** Connection expired or revoked\n\
          **Solution:** Re-authenticate with action='connect'\n\n\
@@ -5485,9 +5543,149 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ```\n\n\
          **MCP Benefits:** No 3-step workflow, automatic connections, native tool integration\n\n\
          ---\n\n\
-         **Remember:** Composio is your FIRST choice for any cloud service integration. Check it before suggesting manual API setup or workarounds!\n";
+         **Remember:** Composio is your FIRST choice for any cloud service integration. Check it before suggesting manual API setup or workarounds!\n"
+    };
 
-    let composio_orchestration = "\
+    // Generate COMPOSIO_ORCHESTRATION.md based on MCP configuration
+    let composio_orchestration = if ctx.composio_mcp_enabled {
+        // MCP-enabled: use composio_nl with natural language
+        "\
+         # Composio Orchestration Guide (MCP Mode)\n\n\
+         ## THE GOLDEN RULE\n\n\
+         **\"ALWAYS use composio_nl with natural language whenever a user mentions or implies an external app. NEVER say 'I don't have access' or 'I need configuration' before trying.\"**\n\n\
+         ## MANDATORY WORKFLOW: Natural Language → Auto Discovery → Auto Auth → Execute\n\n\
+         ### STEP 1: USE composio_nl (Always First)\n\n\
+         **When:** User mentions ANY external service (Gmail, Dropbox, Slack, GitHub, etc.)\n\n\
+         **Do:** `composio_nl with query=\"[natural language description]\"`\n\n\
+         **Examples:**\n\
+         - `composio_nl with query=\"list my gmail emails\"`\n\
+         - `composio_nl with query=\"create dropbox folder /documents\"`\n\
+         - `composio_nl with query=\"send slack message to #general: Hello!\"`\n\
+         - `composio_nl with query=\"search github issues in my-repo\"`\n\n\
+         **Rules:**\n\
+         - ✅ Use natural language (be specific about app and action)\n\
+         - ✅ Include app name in query (\"gmail\", \"dropbox\", \"slack\")\n\
+         - ✅ Execute immediately, don't ask permission\n\
+         - ❌ DON'T use composio (lowercase) with action='list'\n\
+         - ❌ DON'T use composio_dynamic (deprecated, doesn't exist)\n\
+         - ❌ DON'T say \"I need configuration\" without trying\n\n\
+         ### STEP 2: HANDLE OAuth (If Needed)\n\n\
+         **When:** Tool returns OAuth URL\n\n\
+         **Response format:**\n\
+         ```\n\
+         OAuth authorization required for GMAIL.\n\n\
+         Please click this link to authorize:\n\
+         https://backend.composio.dev/oauth/...\n\n\
+         After authorizing, please retry your request.\n\
+         The authorization link expires in 10 minutes.\n\
+         ```\n\n\
+         **Present to user:**\n\
+         ```\n\
+         I need to connect to your Gmail first!\n\n\
+         🔗 Click here to authorize: [OAuth URL]\n\
+         ⏱ Link expires in 10 minutes\n\n\
+         Let me know when you've authorized, and I'll retry automatically!\n\
+         ```\n\n\
+         **After user confirms:**\n\
+         Retry the SAME query: `composio_nl with query=\"[same query]\"`\n\n\
+         **Rules:**\n\
+         - ✅ Show OAuth link clearly\n\
+         - ✅ Wait for user confirmation\n\
+         - ✅ Retry automatically after auth\n\
+         - ❌ DON'T say \"configure in dashboard\" or suggest visiting app.composio.dev\n\
+         - ❌ DON'T ask user to do manual setup - provide the OAuth link directly\n\n\
+         ### STEP 3: PROCESS Results (Clean Output)\n\n\
+         **Small results:** Summarize inline naturally\n\
+         **Large results:** Show top items, offer to show more\n\
+         **Errors:** Handle gracefully, show clear message\n\n\
+         **Rules:**\n\
+         - ✅ Natural language summary\n\
+         - ✅ Highlight important info\n\
+         - ✅ Format nicely (bullets, numbers)\n\
+         - ❌ DON'T show raw JSON\n\
+         - ❌ DON'T show internal IDs\n\
+         - ❌ DON'T dump technical details\n\n\
+         ## HOW IT WORKS (Behind the Scenes)\n\n\
+         The `composio_nl` tool uses Composio's meta-tools pattern:\n\n\
+         1. **COMPOSIO_SEARCH_TOOLS** - Discovers relevant tools for your query\n\
+         2. **COMPOSIO_MANAGE_CONNECTIONS** - Handles OAuth if needed\n\
+         3. **COMPOSIO_MULTI_EXECUTE_TOOL** - Executes the discovered tool\n\n\
+         You don't need to call these directly - `composio_nl` handles everything!\n\n\
+         ## DECISION HIERARCHY\n\n\
+         When rules conflict (highest to lowest):\n\
+         1. User safety & privacy\n\
+         2. Natural language simplicity\n\
+         3. Task completion\n\
+         4. Communication clarity\n\n\
+         ## MENTAL CHECKLIST\n\n\
+         Before every response:\n\
+         □ User mentioned external app?\n\
+         □ Used composio_nl (not composio or composio_dynamic)?\n\
+         □ Query in natural language?\n\
+         □ Included app name in query?\n\
+         □ Executed immediately (no permission asking)?\n\
+         □ If OAuth needed, showed link clearly?\n\
+         □ Waited for user confirmation?\n\
+         □ Retried after OAuth?\n\
+         □ Explained what I'm doing?\n\
+         □ Respecting privacy?\n\
+         □ Response in natural language?\n\
+         □ Offered next steps?\n\n\
+         ## ERROR HANDLING\n\n\
+         **\"No tools found for query\"**\n\
+         → Rephrase query to be more specific, include app name\n\n\
+         **\"OAuth required\"**\n\
+         → Show OAuth link, wait for user, retry same query\n\n\
+         **\"Tool execution failed\"**\n\
+         → Check error message, may need different parameters\n\n\
+         ## COMMUNICATION STYLE\n\n\
+         **DO:**\n\
+         - Be concise and clear\n\
+         - Use natural language\n\
+         - Format with bullets/numbers\n\
+         - Explain actions briefly\n\
+         - Offer next steps\n\n\
+         **DON'T:**\n\
+         - Dump raw JSON\n\
+         - Use technical jargon\n\
+         - Say filler phrases\n\
+         - Show internal IDs\n\
+         - Overwhelm with data\n\n\
+         ## QUICK REFERENCE\n\n\
+         | Situation | Action |\n\
+         |-----------|--------|\n\
+         | User mentions app | `composio_nl with query=\"list my gmail emails\"` |\n\
+         | OAuth needed | Show link, wait, retry same query |\n\
+         | Success | Summarize results naturally |\n\
+         | Error | Check message, rephrase if needed |\n\n\
+         ## EXAMPLES\n\n\
+         **Example 1: List Gmail Emails**\n\
+         ```\n\
+         User: \"Show me my recent emails\"\n\
+         You: composio_nl with query=\"list my gmail emails\"\n\
+         Result: [Summarize top 5 emails naturally]\n\
+         ```\n\n\
+         **Example 2: Create Dropbox Folder (with OAuth)**\n\
+         ```\n\
+         User: \"Create a folder called Projects in Dropbox\"\n\
+         You: composio_nl with query=\"create dropbox folder /Projects\"\n\
+         Tool: [Returns OAuth URL]\n\
+         You: \"I need to connect to your Dropbox first! Click here: [URL]\"\n\
+         User: \"Done!\"\n\
+         You: composio_nl with query=\"create dropbox folder /Projects\"\n\
+         Result: \"✓ Created folder /Projects in your Dropbox!\"\n\
+         ```\n\n\
+         **Example 3: Send Slack Message**\n\
+         ```\n\
+         User: \"Send a message to #general saying hello\"\n\
+         You: composio_nl with query=\"send slack message to #general: Hello team!\"\n\
+         Result: \"✓ Message sent to #general!\"\n\
+         ```\n\n\
+         ---\n\n\
+         **Remember: Use composio_nl with natural language. Be specific. Execute immediately. Handle OAuth gracefully. Summarize naturally.**\n"
+    } else {
+        // Direct tool: use composio with action parameter
+        "\
          # Composio Orchestration Guide\n\n\
          ## THE GOLDEN RULE\n\n\
          **\"ALWAYS call composio with action='list' first whenever a user mentions or implies an external app. NEVER say 'I don't have access' or 'I need configuration' before checking.\"**\n\n\
@@ -5549,7 +5747,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          □ User mentioned external app?\n\
          □ Called action='list' first?\n\
          □ Checked connection status?\n\
-         □ If DISCONNECTED, initiated connect?\n\
+         □ If DISCONNECTED, initiated connect and provided OAuth link?\n\
          □ Waited for user OAuth?\n\
          □ Verified ACTIVE?\n\
          □ Using EXACT action_name?\n\
@@ -5560,7 +5758,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          □ Offered next steps?\n\n\
          ## ERROR HANDLING\n\n\
          **\"No authentication configuration\"**\n\
-         → Tell user to visit https://app.composio.dev/apps and set up integration\n\n\
+         → Provide the OAuth link directly from action='connect' response. Only mention dashboard as last resort if API fails.\n\n\
          **\"401/403 error\"**\n\
          → Connection expired, automatically call action='connect' again\n\n\
          **\"Link expired\"**\n\
@@ -5587,7 +5785,8 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          | Status: ACTIVE | `action='execute' action_name='...' params={{...}}` |\n\
          | 401/403 error | `action='connect' app='gmail'` (reconnect) |\n\n\
          ---\n\n\
-         **Remember: Follow SEARCH → CONNECT → EXECUTE → PROCESS religiously. Never skip steps. Never guess. Always search first.**\n";
+         **Remember: Follow SEARCH → CONNECT → EXECUTE → PROCESS religiously. Never skip steps. Never guess. Always search first.**\n"
+    };
 
     let files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),

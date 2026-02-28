@@ -284,12 +284,21 @@ impl Tool for ComposioMcpTool {
                                         error = %e,
                                         "OAuth onboarding failed"
                                     );
+                                    // Check if error contains OAuth URL
+                                    let err_msg = e.to_string();
+                                    if err_msg.contains("Please click this link to authorize:") {
+                                        // Pass through the OAuth URL
+                                        return Ok(ToolResult {
+                                            success: false,
+                                            output: String::new(),
+                                            error: Some(err_msg),
+                                        });
+                                    }
                                     return Ok(ToolResult {
                                         success: false,
                                         output: String::new(),
                                         error: Some(format!(
-                                            "OAuth onboarding failed for {}: {}. \
-                                            Please try connecting manually at https://app.composio.dev",
+                                            "OAuth onboarding failed for {}: {}",
                                             toolkit,
                                             e
                                         )),

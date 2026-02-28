@@ -202,12 +202,9 @@ impl ComposioRestBlockingClient {
         if result.items.is_empty() {
             anyhow::bail!(
                 "No authentication configuration found for app '{}'.\n\
-                To fix this:\n\
-                1. Visit https://app.composio.dev/apps and search for '{}'\n\
-                2. Click 'Add Integration' or 'Configure' for {}\n\
-                3. Follow the setup wizard to create an auth config\n\
-                4. Once created, retry connecting",
-                app_name, app_name, app_name
+                This usually means the app needs to be set up in your Composio account first.\n\
+                Please contact support or check the Composio documentation for setup instructions.",
+                app_name
             );
         }
 

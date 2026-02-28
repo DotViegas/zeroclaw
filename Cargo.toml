@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "crates/robot-kit"]
+exclude = ["composio-mcp-test"]
 resolver = "2"
 
 [package]
@@ -73,10 +74,14 @@ chacha20poly1305 = "0.10"
 # HMAC for webhook signature verification
 hmac = "0.12"
 sha2 = "0.10"
+md5 = "0.7"
 hex = "0.4"
 
 # CSPRNG for secure token generation
 rand = "0.10"
+
+# Open URLs in browser
+open = "5.3"
 
 # serde-big-array for wa-rs storage (large array serialization)
 serde-big-array = { version = "0.5", optional = true }
@@ -92,6 +97,11 @@ ring = "0.17"
 
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
+
+# Office file manipulation (optional, enable with --features office-edit)
+rust_xlsxwriter = { version = "0.78", optional = true }
+docx-rs = { version = "0.4", optional = true }
+zip = { version = "2.2", optional = true }
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -199,6 +209,8 @@ probe = ["dep:probe-rs"]
 rag-pdf = ["dep:pdf-extract"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
+# office-edit = Office file editing (Word, Excel) with Composio integration
+office-edit = ["dep:rust_xlsxwriter", "dep:docx-rs", "dep:zip"]
 
 [profile.release]
 opt-level = "z"      # Optimize for size

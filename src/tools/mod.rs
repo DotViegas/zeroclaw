@@ -21,6 +21,7 @@ pub mod cli_discovery;
 pub mod composio;
 pub mod composio_meta;
 pub mod composio_mcp;
+pub mod composio_nl;
 pub mod content_search;
 pub mod cron_add;
 pub mod cron_list;
@@ -43,6 +44,7 @@ pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
+pub mod office_edit;
 pub mod pdf_read;
 pub mod proxy_config;
 pub mod pushover;
@@ -56,8 +58,8 @@ pub mod web_search_tool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
-pub use composio_meta::ComposioMetaTool;
 pub use composio_mcp::ComposioMcpTool;
+pub use composio_nl::ComposioNaturalLanguageTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
@@ -80,6 +82,7 @@ pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
+pub use office_edit::OfficeEditTool;
 pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -95,7 +98,7 @@ pub use web_search_tool::WebSearchTool;
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
-use crate::mcp::{ComposioMcpClient, McpTool};
+use crate::mcp::{ComposioMcpClient, McpClient, McpTool};
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -167,6 +170,7 @@ pub fn default_tools_with_runtime(
 /// * `api_key` - Composio API key for authentication
 /// * `entity_id_fallback` - Fallback entity ID if user_id not set in MCP config
 /// * `security` - Security policy for access control
+/// * `provider` - Optional LLM provider for intelligent parameter extraction
 ///
 /// # Returns
 /// Vector of Arc-wrapped tools ready to be added to the tool registry
@@ -175,6 +179,7 @@ pub async fn load_composio_mcp_tools(
     api_key: &str,
     entity_id_fallback: &str,
     security: Arc<SecurityPolicy>,
+    provider: Option<Arc<dyn crate::providers::Provider>>,
 ) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
     if !mcp_config.enabled {
         return Ok(Vec::new());
@@ -255,44 +260,50 @@ pub async fn load_composio_mcp_tools(
             "Composio Pattern 2 detected: using dynamic tool discovery via meta-tools"
         );
 
-        // Create REST client for meta-tool
-        let rest_client = Arc::new(crate::composio::ComposioRestClient::new(api_key.to_string()));
-
-        // Create onboarding handler
-        let onboarding: Option<Arc<dyn crate::composio::ComposioOnboarding>> = {
-            use crate::composio::{CliOnboarding, OnboardingUx, ServerOnboarding};
-
-            let ui_mode = std::env::var("ZEROCLAW_UI_MODE")
-                .unwrap_or_else(|_| "cli".to_string());
-
-            match ui_mode.as_str() {
-                "server" => Some(Arc::new(ServerOnboarding::new(rest_client.clone()))),
-                "cli" => {
-                    let no_browser = std::env::var("ZEROCLAW_NO_BROWSER")
-                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                        .unwrap_or(false);
-
-                    let ux = if no_browser {
-                        OnboardingUx::CliPrintOnly
-                    } else {
-                        OnboardingUx::CliAutoOpen
-                    };
-
-                    Some(Arc::new(CliOnboarding::new(rest_client.clone(), ux)))
-                }
-                _ => None,
+        // Create SSE-based MCP client for meta-tools
+        let mcp_url = if let Some(url) = &mcp_config.mcp_url {
+            url.clone()
+        } else if let Some(server_id) = &mcp_config.server_id {
+            // Construct URL from server_id
+            if server_id.starts_with("trs_") {
+                // Tool Router Session format
+                format!(
+                    "https://backend.composio.dev/tool_router/{}/mcp?include_composio_helper_actions=true&user_id={}",
+                    server_id, user_id
+                )
+            } else {
+                // Dedicated MCP Server format
+                format!(
+                    "https://backend.composio.dev/tool_router/{}/mcp?include_composio_helper_actions=true&user_id={}",
+                    server_id, user_id
+                )
             }
+        } else {
+            anyhow::bail!("MCP configuration requires either mcp_url or server_id");
         };
 
-        // Create single meta-tool that wraps all discovery and execution
-        let meta_tool = Arc::new(ComposioMetaTool::new(
-            client,
-            rest_client,
-            security,
-            onboarding,
-        )) as Arc<dyn Tool>;
+        let sse_client = Arc::new(
+            McpClient::new(mcp_url, mcp_api_key.to_string())
+                .context("Failed to create SSE MCP client")?
+        );
 
-        return Ok(vec![meta_tool]);
+        // Create natural language tool that wraps meta-tools workflow
+        let nl_tool: Arc<dyn Tool> = if let Some(provider) = provider {
+            Arc::new(ComposioNaturalLanguageTool::new_with_provider(
+                sse_client,
+                security,
+                provider,
+                api_key.to_string(),
+            ))
+        } else {
+            Arc::new(ComposioNaturalLanguageTool::new(
+                sse_client,
+                security,
+                api_key.to_string(),
+            ))
+        };
+
+        return Ok(vec![nl_tool]);
     }
 
     // Pattern 1: Direct app tools
@@ -367,6 +378,7 @@ pub async fn all_tools(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    provider: Option<Arc<dyn crate::providers::Provider>>,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         config,
@@ -381,6 +393,7 @@ pub async fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        provider,
     )
     .await
 }
@@ -400,6 +413,7 @@ pub async fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
+    provider: Option<Arc<dyn crate::providers::Provider>>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
@@ -482,12 +496,35 @@ pub async fn all_tools_with_runtime(
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
+    // Office file editing (feature-gated at compile time via office-edit)
+    // Requires Composio API key for staging binary files
+    #[cfg(feature = "office-edit")]
+    if let Some(api_key) = composio_key {
+        tool_arcs.push(Arc::new(OfficeEditTool::new(
+            security.clone(),
+            api_key.to_string(),
+        )));
+    }
+
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    if let Some(key) = composio_key {
+    // Add Composio tool (REST API) - only if MCP Pattern 2 is not active
+    // Pattern 2 provides composio_nl which is more powerful
+    let should_load_rest_composio = if let Some(key) = composio_key {
         if !key.is_empty() {
+            // Check if MCP is enabled - if so, we'll load MCP tools instead
+            !root_config.composio.mcp.enabled
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if should_load_rest_composio {
+        if let Some(key) = composio_key {
             tool_arcs.push(Arc::new(ComposioTool::new(
                 key,
                 composio_entity_id,
@@ -534,6 +571,7 @@ pub async fn all_tools_with_runtime(
                 key,
                 composio_entity_id.unwrap_or(&root_config.composio.entity_id),
                 security.clone(),
+                provider.clone(),
             )
             .await
             {

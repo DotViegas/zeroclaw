@@ -50,6 +50,7 @@ Last reviewed: **February 18, 2026**.
 | `docs/nextcloud-talk-setup.md` | Current Guide | operators |
 | `docs/config-reference.md` | Current Reference | operators |
 | `docs/custom-providers.md` | Current Integration Guide | integration developers |
+| `docs/composio-mcp-integration.md` | Current Integration Guide | users/operators |
 | `docs/zai-glm-setup.md` | Current Provider Setup Guide | users/operators |
 | `docs/langgraph-integration.md` | Current Integration Guide | integration developers |
 | `docs/operations-runbook.md` | Current Guide | operators |

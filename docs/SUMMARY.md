@@ -37,6 +37,7 @@ Last refreshed: **February 18, 2026**.
 - [nextcloud-talk-setup.md](nextcloud-talk-setup.md)
 - [config-reference.md](config-reference.md)
 - [custom-providers.md](custom-providers.md)
+- [composio-mcp-integration.md](composio-mcp-integration.md)
 - [zai-glm-setup.md](zai-glm-setup.md)
 - [langgraph-integration.md](langgraph-integration.md)
 

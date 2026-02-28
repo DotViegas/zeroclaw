@@ -15,6 +15,7 @@ Localized hubs: [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · 
 | Find commands by task | [commands-reference.md](commands-reference.md) |
 | Check config defaults and keys quickly | [config-reference.md](config-reference.md) |
 | Configure custom providers/endpoints | [custom-providers.md](custom-providers.md) |
+| Configure Composio MCP integration | [composio-mcp-integration.md](composio-mcp-integration.md) |
 | Configure Z.AI / GLM provider | [zai-glm-setup.md](zai-glm-setup.md) |
 | Use LangGraph integration patterns | [langgraph-integration.md](langgraph-integration.md) |
 | Operate runtime (day-2 runbook) | [operations-runbook.md](operations-runbook.md) |

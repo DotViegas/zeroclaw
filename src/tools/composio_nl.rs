@@ -624,6 +624,24 @@ impl ComposioNaturalLanguageTool {
     fn try_quick_extraction(&self, query: &str, tool_slug: &str) -> Option<Value> {
         // Quick extraction for email sending (most common case)
         if tool_slug.contains("SEND_EMAIL") || tool_slug.contains("EMAIL_SEND") {
+            // CRITICAL: Skip Layer 1 if query mentions file/attachment keywords
+            // These require context from previous tool calls (s3key from DROPBOX_READ_FILE)
+            // and must be handled by Layer 2 (LLM) which has access to conversation history
+            let query_lower = query.to_lowercase();
+            let attachment_keywords = [
+                "file", "arquivo", "attach", "anexo", "anexar",
+                "dropbox", "drive", "document", "documento",
+                "send file", "enviar arquivo", "with file", "com arquivo"
+            ];
+            
+            if attachment_keywords.iter().any(|kw| query_lower.contains(kw)) {
+                tracing::debug!(
+                    query = query,
+                    "Query mentions file/attachment keywords - skipping Layer 1, will use Layer 2 (LLM)"
+                );
+                return None;
+            }
+            
             let mut args = serde_json::json!({});
             let mut found_any = false;
             
@@ -644,12 +662,6 @@ impl ComposioNaturalLanguageTool {
                 args["body"] = body;
                 found_any = true;
             }
-            
-            // NOTE: Attachment extraction is NOT handled here in Layer 1
-            // because it requires context from previous tool calls (s3key from DROPBOX_READ_FILE, etc.)
-            // Layer 2 (LLM) should handle attachment context when the query mentions
-            // "attach file", "send file", "with attachment", etc.
-            // The LLM can reference previous tool results to extract s3key/mimetype/name
             
             // CRITICAL: Only return if we have at least recipient AND (subject OR body)
             // Gmail API requires: at least one recipient + at least one of subject/body

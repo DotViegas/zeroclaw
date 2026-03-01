@@ -61,6 +61,10 @@ pub struct ComposioNaturalLanguageTool {
     
     // API key for Composio REST API (staging, etc)
     api_key: String,
+    
+    // Execution history for context in LLM extraction
+    // Stores recent tool executions (tool_slug, query, result) for attachment context
+    execution_history: Arc<RwLock<Vec<(String, String, Value)>>>,
 }
 
 impl ComposioNaturalLanguageTool {
@@ -75,6 +79,7 @@ impl ComposioNaturalLanguageTool {
             provider: None,
             model: None,
             api_key,
+            execution_history: Arc::new(RwLock::new(Vec::new())),
         }
     }
     
@@ -95,6 +100,7 @@ impl ComposioNaturalLanguageTool {
             provider: Some(provider),
             model,
             api_key,
+            execution_history: Arc::new(RwLock::new(Vec::new())),
         }
     }
     
@@ -104,6 +110,50 @@ impl ComposioNaturalLanguageTool {
         let current = *id;
         *id += 1;
         current
+    }
+    
+    /// Extract file metadata from execution history for attachment context
+    /// Returns a formatted string with recent file downloads (s3key, mimetype, name)
+    async fn get_attachment_context(&self) -> String {
+        let history = self.execution_history.read().await;
+        
+        let mut context_parts = Vec::new();
+        
+        for (tool_slug, _args, result) in history.iter().rev().take(5) {
+            // Look for DROPBOX_READ_FILE or similar download operations
+            if tool_slug.contains("READ_FILE") || tool_slug.contains("DOWNLOAD") || tool_slug.contains("GET_FILE") {
+                // Try to extract file metadata from result
+                if let Some(data) = result.get("data") {
+                    if let Some(results) = data.get("results").and_then(|r| r.as_array()) {
+                        for result_item in results {
+                            if let Some(response) = result_item.get("response") {
+                                if let Some(response_data) = response.get("data") {
+                                    // Check for content field (Dropbox format)
+                                    if let Some(content) = response_data.get("content") {
+                                        let name = content.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+                                        let mimetype = content.get("mimetype").and_then(|m| m.as_str()).unwrap_or("application/octet-stream");
+                                        let s3key = content.get("s3key").and_then(|k| k.as_str())
+                                            .or_else(|| content.get("s3url").and_then(|u| u.as_str()))
+                                            .unwrap_or("unknown");
+                                        
+                                        context_parts.push(format!(
+                                            "- File downloaded: name=\"{}\", mimetype=\"{}\", s3key=\"{}\"",
+                                            name, mimetype, s3key
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if context_parts.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nRECENT FILE DOWNLOADS (for attachment context):\n{}\n", context_parts.join("\n"))
+        }
     }
     
     /// Get or create a session for the current workflow
@@ -690,6 +740,9 @@ impl ComposioNaturalLanguageTool {
             "Calling LLM for parameter extraction"
         );
         
+        // Get attachment context from execution history
+        let attachment_context = self.get_attachment_context().await;
+        
         // Build a focused prompt for parameter extraction
         let schema_str = serde_json::to_string_pretty(schema)?;
         let prompt = format!(
@@ -697,7 +750,7 @@ impl ComposioNaturalLanguageTool {
              Tool: {}\n\
              Use case: {}\n\
              Parameter schema:\n{}\n\n\
-             User query: \"{}\"\n\n\
+             User query: \"{}\"{}\n\n\
              CRITICAL INSTRUCTIONS:\n\
              1. Analyze the user query and extract values for the parameters defined in the schema\n\
              2. Return ONLY a valid JSON object with the extracted parameters\n\
@@ -707,16 +760,20 @@ impl ComposioNaturalLanguageTool {
              6. NEVER put file content in 's3key' - s3key is a storage reference, not content\n\
              7. If the schema requires 'content' with 's3key', use 'local_file_path' instead\n\
              8. For 'local_file_path', use the absolute path from the query or infer from filename\n\
-             9. For email attachments: if the query mentions sending/attaching a file AND you see\n\
-                file metadata in the conversation context (s3key, mimetype, name from previous tool calls),\n\
-                include an 'attachment' field with structure: {{\"name\": \"filename\", \"mimetype\": \"type\", \"s3key\": \"key\"}}\n\
+             9. IMPORTANT FOR EMAIL ATTACHMENTS:\n\
+                - If the query mentions 'attach', 'file', 'arquivo', 'anexo', 'from dropbox', 'from drive'\n\
+                - AND the schema has an 'attachment' field (check the schema above!)\n\
+                - AND you see file metadata in the RECENT FILE DOWNLOADS section above\n\
+                - THEN you MUST include the 'attachment' field in your response\n\
+                - Use the EXACT s3key, mimetype, and name from the RECENT FILE DOWNLOADS\n\
+                - Structure: {{\"name\": \"<from downloads>\", \"mimetype\": \"<from downloads>\", \"s3key\": \"<from downloads>\"}}\n\
              10. Do not include any explanation, only the JSON object\n\n\
              Example output format:\n\
              {{\"path\": \"/test.txt\", \"local_file_path\": \"C:/temp/test.txt\", \"mode\": \"overwrite\"}}\n\n\
-             Example with attachment:\n\
+             Example with attachment (REQUIRED when query mentions file + schema has attachment field + file in downloads):\n\
              {{\"recipient_email\": \"user@example.com\", \"subject\": \"File\", \"body\": \"See attached\", \"attachment\": {{\"name\": \"file.txt\", \"mimetype\": \"text/plain\", \"s3key\": \"268883/...\"}}}}\n\n\
              JSON:",
-            tool_slug, use_case, schema_str, query
+            tool_slug, use_case, schema_str, query, attachment_context
         );
         
         // Make a quick LLM call (no history, just extraction)
@@ -1423,6 +1480,28 @@ impl ComposioNaturalLanguageTool {
         }
         
         tracing::info!("Tool executed successfully");
+        
+        // Store execution in history for context in future LLM extractions
+        // Keep only last 10 executions to avoid memory bloat
+        {
+            let mut history = self.execution_history.write().await;
+            history.push((
+                tool_slug.to_string(),
+                arguments.to_string(),
+                parsed_data.clone(),
+            ));
+            
+            // Keep only last 10 executions
+            if history.len() > 10 {
+                history.remove(0);
+            }
+            
+            tracing::debug!(
+                history_size = history.len(),
+                "Updated execution history"
+            );
+        }
+        
         Ok(parsed_data)
     }
 }

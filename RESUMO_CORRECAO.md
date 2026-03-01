@@ -14,29 +14,17 @@ Resultado:
 ❌ Email enviado SEM anexo (apenas texto informativo)
 ```
 
-## Causa Raiz
+## Causa Raiz (Duas Partes)
 
-A função `try_quick_extraction` em `src/tools/composio_nl.rs` extraía apenas:
-- `recipient_email`
-- `subject`  
-- `body`
+### Parte 1: LLM sem instruções sobre anexos
+A função `extract_with_llm` não tinha instruções específicas sobre como extrair e incluir anexos.
 
-O campo `attachment` nunca era processado, mesmo quando o `s3key` estava disponível.
+### Parte 2: Layer 1 muito agressivo
+O Layer 1 (quick extraction) estava retornando sucesso mesmo para queries com arquivos/anexos, impedindo que o Layer 2 (LLM) fosse chamado. Como o Layer 1 não tem acesso ao contexto da conversa, ele não pode incluir o campo `attachment`.
 
-## Solução Implementada
+## Solução Implementada (Duas Correções)
 
-### 1. Documentação no Código (Layer 1)
-
-Adicionado comentário explicando que anexos requerem contexto de chamadas anteriores:
-
-```rust
-// NOTE: Attachment extraction is NOT handled here in Layer 1
-// because it requires context from previous tool calls (s3key from DROPBOX_READ_FILE, etc.)
-// Layer 2 (LLM) should handle attachment context when the query mentions
-// "attach file", "send file", "with attachment", etc.
-```
-
-### 2. Instruções Aprimoradas para o LLM (Layer 2)
+### Correção 1: Instruções Aprimoradas para o LLM
 
 Adicionadas instruções específicas no prompt do LLM:
 
@@ -46,46 +34,42 @@ Adicionadas instruções específicas no prompt do LLM:
    include an 'attachment' field with structure: {"name": "filename", "mimetype": "type", "s3key": "key"}
 ```
 
-Exemplo adicionado ao prompt:
-```json
-{
-  "recipient_email": "user@example.com",
-  "subject": "File",
-  "body": "See attached",
-  "attachment": {
-    "name": "file.txt",
-    "mimetype": "text/plain",
-    "s3key": "268883/..."
-  }
+### Correção 2: Bypass do Layer 1 para Queries com Anexos
+
+Adicionada detecção de keywords no Layer 1:
+
+```rust
+let attachment_keywords = [
+    "file", "arquivo", "attach", "anexo", "anexar",
+    "dropbox", "drive", "document", "documento",
+    "send file", "enviar arquivo", "with file", "com arquivo"
+];
+
+if attachment_keywords.iter().any(|kw| query_lower.contains(kw)) {
+    return None; // Force Layer 2 (LLM)
 }
 ```
-
-### 3. Testes Automatizados
-
-Criado `tests/composio_email_attachment.rs` com 5 testes:
-- ✅ Estrutura do anexo é válida
-- ✅ Email com anexo é válido
-- ✅ Prompt do LLM inclui instruções de anexo
-- ✅ Layer 1 não trata anexos (por design)
-- ✅ Workflow completo: download → envio com anexo
 
 ## Arquivos Modificados
 
 1. **src/tools/composio_nl.rs**
-   - Linha ~624: Documentação no `try_quick_extraction`
+   - Linha ~624: Detecção de keywords e bypass do Layer 1
    - Linha ~680: Instruções aprimoradas no `extract_with_llm`
 
 2. **tests/composio_email_attachment.rs** (novo)
    - 5 testes documentando o comportamento esperado
 
 3. **COMPOSIO_ATTACHMENT_FIX.md** (novo)
-   - Documentação técnica da correção
+   - Documentação técnica da correção inicial
 
-4. **GUIA_ANEXOS_EMAIL.md** (novo)
+4. **CORRECAO_LAYER1_BYPASS.md** (novo)
+   - Documentação da correção do Layer 1
+
+5. **GUIA_ANEXOS_EMAIL.md** (novo)
    - Guia do usuário com exemplos práticos
 
-5. **RESUMO_CORRECAO.md** (este arquivo)
-   - Resumo executivo da correção
+6. **RESUMO_CORRECAO.md** (este arquivo)
+   - Resumo executivo completo
 
 ## Como Testar
 
@@ -98,6 +82,9 @@ Resultado esperado: `5 passed; 0 failed`
 
 ### Teste Manual
 ```bash
+# Recompilar
+cargo build --release
+
 # Com logs detalhados
 $env:RUST_LOG="zeroclaw=debug"
 
@@ -107,13 +94,53 @@ zeroclaw agent -m "Pegue o arquivo hello.txt do Dropbox e envie para jvvbsj12@gm
 
 ### Verificação nos Logs
 
-Procure por:
+Procure por estas linhas (em ordem):
+
+1. **Bypass do Layer 1:**
 ```
-INFO zeroclaw::tools::composio_nl: Layer 2: LLM extraction successful
-  arguments={"recipient_email":"...","subject":"...","body":"...","attachment":{...}}
+DEBUG zeroclaw::tools::composio_nl: Query mentions file/attachment keywords - skipping Layer 1, will use Layer 2 (LLM)
 ```
 
-Se você ver o campo `attachment`, a correção funcionou!
+2. **Layer 2 com anexo:**
+```
+INFO zeroclaw::tools::composio_nl: Layer 2: LLM extraction successful
+  arguments={"recipient_email":"...","attachment":{"name":"hello.txt","mimetype":"text/plain","s3key":"..."}}
+```
+
+Se você ver ambas as linhas, a correção está funcionando! 📎
+
+## Fluxo Corrigido
+
+### Antes (Incorreto):
+```
+Query: "Envie arquivo do Dropbox"
+  ↓
+Layer 1: Quick extraction (retorna sucesso)
+  ↓
+Resultado: {"recipient_email": "...", "body": "..."}
+  ↓
+Email SEM anexo ❌
+```
+
+### Depois (Correto):
+```
+Query: "Envie arquivo do Dropbox"
+  ↓
+Layer 1: Detecta "arquivo" → retorna None
+  ↓
+Layer 2: LLM com contexto completo
+  ↓ (vê s3key do DROPBOX_READ_FILE)
+Resultado: {
+  "recipient_email": "...",
+  "attachment": {
+    "name": "hello.txt",
+    "mimetype": "text/plain",
+    "s3key": "268883/..."
+  }
+}
+  ↓
+Email COM anexo ✅
+```
 
 ## Estrutura Correta do Attachment
 
@@ -142,25 +169,41 @@ Segundo a Composio, o campo `attachment` deve ser um `FileUploadable`:
 
 1. **Contexto do LLM**: O modelo precisa "ver" o resultado do `DROPBOX_READ_FILE` para extrair o `s3key`
 2. **Tamanho**: Gmail limita anexos a ~25MB
-3. **Expiração**: `s3key` pode expirar (improvável em uso normal)
+3. **Keywords**: Atualmente suporta português e inglês
+4. **False Positives**: Queries que mencionam "file" mas não são sobre anexos usarão Layer 2 desnecessariamente (mais lento, mas funciona)
 
 ## Status da Correção
 
-- ✅ Código modificado
+- ✅ Código modificado (2 correções)
 - ✅ Testes criados e passando
 - ✅ Documentação técnica criada
 - ✅ Guia do usuário criado
 - ✅ Build de release bem-sucedido
+- ✅ Commits enviados para GitHub
+
+## Commits
+
+1. **`53b662df`** - feat(composio): add email attachment support for Dropbox files
+   - Instruções do LLM para anexos
+   - Documentação inicial
+   - Testes automatizados
+
+2. **`004eba27`** - fix(composio): force Layer 2 (LLM) for email queries with file/attachment keywords
+   - Detecção de keywords no Layer 1
+   - Bypass para forçar uso do Layer 2
+   - Correção do problema de Layer 1 muito agressivo
 
 ## Próximos Passos
 
 1. **Testar em produção** com casos reais
-2. **Monitorar logs** para verificar se o LLM está incluindo anexos
+2. **Monitorar logs** para verificar se Layer 2 está sendo usado
 3. **Coletar feedback** dos usuários
 4. **Considerar melhorias**:
    - Suporte a múltiplos anexos
    - Validação de tamanho antes do envio
    - Fallback para link compartilhado se arquivo for muito grande
+   - Keywords para outros idiomas (espanhol, francês, etc.)
+   - ML para detecção mais inteligente de intenção de anexo
 
 ## Referências
 

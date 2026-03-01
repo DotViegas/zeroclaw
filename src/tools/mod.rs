@@ -180,6 +180,7 @@ pub async fn load_composio_mcp_tools(
     entity_id_fallback: &str,
     security: Arc<SecurityPolicy>,
     provider: Option<Arc<dyn crate::providers::Provider>>,
+    model: Option<String>,
 ) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
     if !mcp_config.enabled {
         return Ok(Vec::new());
@@ -293,6 +294,7 @@ pub async fn load_composio_mcp_tools(
                 sse_client,
                 security,
                 provider,
+                model,
                 api_key.to_string(),
             ))
         } else {
@@ -379,6 +381,7 @@ pub async fn all_tools(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
     provider: Option<Arc<dyn crate::providers::Provider>>,
+    model: Option<String>,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         config,
@@ -394,6 +397,7 @@ pub async fn all_tools(
         fallback_api_key,
         root_config,
         provider,
+        model,
     )
     .await
 }
@@ -414,6 +418,7 @@ pub async fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
     provider: Option<Arc<dyn crate::providers::Provider>>,
+    model: Option<String>,
 ) -> Vec<Box<dyn Tool>> {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
@@ -572,6 +577,7 @@ pub async fn all_tools_with_runtime(
                 composio_entity_id.unwrap_or(&root_config.composio.entity_id),
                 security.clone(),
                 provider.clone(),
+                model.clone(),
             )
             .await
             {

@@ -56,6 +56,9 @@ pub struct ComposioNaturalLanguageTool {
     // Provider for LLM-assisted parameter extraction
     provider: Option<Arc<dyn crate::providers::Provider>>,
     
+    // Model to use for LLM-assisted extraction (if provider is set)
+    model: Option<String>,
+    
     // API key for Composio REST API (staging, etc)
     api_key: String,
 }
@@ -70,6 +73,7 @@ impl ComposioNaturalLanguageTool {
             session_ttl: std::time::Duration::from_secs(1800), // 30 minutes
             request_id: Arc::new(RwLock::new(1)),
             provider: None,
+            model: None,
             api_key,
         }
     }
@@ -79,6 +83,7 @@ impl ComposioNaturalLanguageTool {
         mcp_client: Arc<McpClient>,
         security: Arc<SecurityPolicy>,
         provider: Arc<dyn crate::providers::Provider>,
+        model: Option<String>,
         api_key: String,
     ) -> Self {
         Self {
@@ -88,6 +93,7 @@ impl ComposioNaturalLanguageTool {
             session_ttl: std::time::Duration::from_secs(1800), // 30 minutes
             request_id: Arc::new(RwLock::new(1)),
             provider: Some(provider),
+            model,
             api_key,
         }
     }
@@ -639,7 +645,18 @@ impl ComposioNaturalLanguageTool {
                 found_any = true;
             }
             
-            if found_any {
+            // NOTE: Attachment extraction is NOT handled here in Layer 1
+            // because it requires context from previous tool calls (s3key from DROPBOX_READ_FILE, etc.)
+            // Layer 2 (LLM) should handle attachment context when the query mentions
+            // "attach file", "send file", "with attachment", etc.
+            // The LLM can reference previous tool results to extract s3key/mimetype/name
+            
+            // CRITICAL: Only return if we have at least recipient AND (subject OR body)
+            // Gmail API requires: at least one recipient + at least one of subject/body
+            let has_recipient = args.get("recipient_email").is_some();
+            let has_content = args.get("subject").is_some() || args.get("body").is_some();
+            
+            if found_any && has_recipient && has_content {
                 return Some(args);
             }
         }
@@ -678,9 +695,14 @@ impl ComposioNaturalLanguageTool {
              6. NEVER put file content in 's3key' - s3key is a storage reference, not content\n\
              7. If the schema requires 'content' with 's3key', use 'local_file_path' instead\n\
              8. For 'local_file_path', use the absolute path from the query or infer from filename\n\
-             9. Do not include any explanation, only the JSON object\n\n\
+             9. For email attachments: if the query mentions sending/attaching a file AND you see\n\
+                file metadata in the conversation context (s3key, mimetype, name from previous tool calls),\n\
+                include an 'attachment' field with structure: {{\"name\": \"filename\", \"mimetype\": \"type\", \"s3key\": \"key\"}}\n\
+             10. Do not include any explanation, only the JSON object\n\n\
              Example output format:\n\
              {{\"path\": \"/test.txt\", \"local_file_path\": \"C:/temp/test.txt\", \"mode\": \"overwrite\"}}\n\n\
+             Example with attachment:\n\
+             {{\"recipient_email\": \"user@example.com\", \"subject\": \"File\", \"body\": \"See attached\", \"attachment\": {{\"name\": \"file.txt\", \"mimetype\": \"text/plain\", \"s3key\": \"268883/...\"}}}}\n\n\
              JSON:",
             tool_slug, use_case, schema_str, query
         );
@@ -690,66 +712,55 @@ impl ComposioNaturalLanguageTool {
             crate::providers::ChatMessage::user(prompt),
         ];
         
-        // Use a fast model with low temperature for deterministic extraction
-        // Try multiple models in order of preference (fast and cheap)
-        let models = [
-            "gpt-4o-mini",                    // OpenAI fast model
-            "gpt-3.5-turbo",                  // OpenAI fallback
-            "anthropic/claude-3-haiku",       // OpenRouter Anthropic
-            "claude-3-haiku-20240307",        // Direct Anthropic
-        ];
+        // Use the provider's configured model with low temperature for deterministic extraction
+        // The model comes from the user's configuration
+        let model = self.model.as_deref().unwrap_or("");
+        let request = crate::providers::ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
         
-        let mut last_error = None;
-        for model in &models {
-            let request = crate::providers::ChatRequest {
-                messages: &messages,
-                tools: None,
-            };
-            
-            match provider.chat(request, model, 0.0).await {
-                Ok(response) => {
-                    tracing::debug!(
-                        model = model,
-                        "LLM extraction successful with model"
-                    );
-                    
-                    // Parse the JSON response
-                    let content = response.text_or_empty().trim();
-                    
-                    // Try to extract JSON from the response (handle cases where LLM adds explanation)
-                    let json_str = if let Some(start) = content.find('{') {
-                        if let Some(end) = content.rfind('}') {
-                            &content[start..=end]
-                        } else {
-                            content
-                        }
+        // Try with the configured model
+        match provider.chat(request, model, 0.0).await {
+            Ok(response) => {
+                tracing::debug!(
+                    model = model,
+                    "LLM extraction successful with configured model"
+                );
+                
+                // Parse the JSON response
+                let content = response.text_or_empty().trim();
+                
+                // Try to extract JSON from the response (handle cases where LLM adds explanation)
+                let json_str = if let Some(start) = content.find('{') {
+                    if let Some(end) = content.rfind('}') {
+                        &content[start..=end]
                     } else {
                         content
-                    };
-                    
-                    let extracted: Value = serde_json::from_str(json_str)
-                        .with_context(|| format!("Failed to parse LLM response as JSON: {}", json_str))?;
-                    
-                    tracing::debug!(
-                        extracted = ?extracted,
-                        "LLM extraction completed"
-                    );
-                    
-                    return Ok(extracted);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        model = model,
-                        error = %e,
-                        "Model failed, trying next"
-                    );
-                    last_error = Some(e);
-                }
+                    }
+                } else {
+                    content
+                };
+                
+                let extracted: Value = serde_json::from_str(json_str)
+                    .with_context(|| format!("Failed to parse LLM response as JSON: {}", json_str))?;
+                
+                tracing::debug!(
+                    extracted = ?extracted,
+                    "LLM extraction completed"
+                );
+                
+                Ok(extracted)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = model,
+                    error = %e,
+                    "LLM extraction failed with configured model"
+                );
+                Err(e)
             }
         }
-        
-        // All models failed
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No models available")))
     }
     
     /// Layer 3: Generic fallback extraction
@@ -836,6 +847,38 @@ impl ComposioNaturalLanguageTool {
     
     /// Extract file path from query
     fn extract_file_path(&self, query: &str) -> Option<String> {
+        // Try to extract path from common patterns
+        // Look for paths that start with / or contain /
+        
+        // Pattern 1: Direct path mention (e.g., "to /teste/hello.txt")
+        if let Some(start) = query.find(" /") {
+            let after = &query[start + 1..]; // Skip the space
+            // Take until next space, quote, or common stop word
+            let stop_words = [" in ", " with ", " and ", " overwrite", " mode"];
+            let mut end_pos = after.len();
+            
+            for stop_word in &stop_words {
+                if let Some(pos) = after.find(stop_word) {
+                    if pos < end_pos {
+                        end_pos = pos;
+                    }
+                }
+            }
+            
+            // Also stop at quotes
+            if let Some(quote_pos) = after.find('\'').or_else(|| after.find('"')) {
+                if quote_pos < end_pos {
+                    end_pos = quote_pos;
+                }
+            }
+            
+            let path = after[..end_pos].trim();
+            if !path.is_empty() && path.starts_with('/') {
+                return Some(path.to_string());
+            }
+        }
+        
+        // Pattern 2: Traditional patterns (file called, file named, etc.)
         let patterns = [
             ("file called ", vec![" in", " to", " with", " containing"]),
             ("file named ", vec![" in", " to", " with", " containing"]),
@@ -881,7 +924,17 @@ impl ComposioNaturalLanguageTool {
                         cleaned = &cleaned[5..];
                     }
                     
-                    // Take first word as filename (stop at space)
+                    // If it already looks like a path, use it as-is
+                    if cleaned.contains('/') {
+                        let path = if cleaned.starts_with('/') {
+                            cleaned.to_string()
+                        } else {
+                            format!("/{}", cleaned)
+                        };
+                        return Some(path);
+                    }
+                    
+                    // Otherwise take first word as filename (stop at space)
                     let cleaned = cleaned.split_whitespace().next().unwrap_or(cleaned);
                     
                     // Ensure path starts with /
@@ -1307,6 +1360,40 @@ impl ComposioNaturalLanguageTool {
         // Note: error field might be empty string, so check if it's non-empty
         if let Some(error) = parsed_data.get("error").and_then(|e| e.as_str()) {
             if !error.is_empty() {
+                // Check if it's a path/permission error (App Folder limitation)
+                let is_path_restriction = error.to_lowercase().contains("path")
+                    || error.to_lowercase().contains("not_found")
+                    || error.to_lowercase().contains("restricted")
+                    || error.to_lowercase().contains("permission")
+                    || error.to_lowercase().contains("access");
+                
+                if is_path_restriction && tool_slug == "DROPBOX_UPLOAD_FILE" {
+                    // Extract the path that failed
+                    let failed_path = arguments.get("path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("unknown path");
+                    
+                    tracing::warn!(
+                        path = failed_path,
+                        error = error,
+                        "Dropbox upload failed - likely App Folder restriction"
+                    );
+                    
+                    // Return a special error that the agent can detect and handle
+                    anyhow::bail!(
+                        "Dropbox Access Limitation: Failed to upload to {}\n\n\
+                        The upload failed because your Dropbox connection is limited to App Folder access, \
+                        which restricts uploads to specific folders only.\n\n\
+                        I can fix this by reconnecting your Dropbox with Full Access, which will allow \
+                        uploads to any folder in your Dropbox.\n\n\
+                        Would you like me to reconnect with Full Access now? \
+                        I'll need you to authorize in your browser, then I can retry the upload.\n\n\
+                        Original error: {}",
+                        failed_path,
+                        error
+                    );
+                }
+                
                 anyhow::bail!("Tool execution failed: {}", error);
             }
         }
@@ -1458,11 +1545,25 @@ impl Tool for ComposioNaturalLanguageTool {
             }
         }
         
-        // 5. Prepare arguments - extract from query if not provided
-        let tool_args = if let Some(args) = provided_args {
-            args
+        // 5. Prepare arguments - merge provided args with extracted args
+        let tool_args = if let Some(mut provided) = provided_args {
+            // If user provided some arguments, merge with extracted ones
+            // Extracted args fill in missing fields, but provided args take precedence
+            let extracted = self.extract_arguments_from_query(query, &tool.tool_slug, &discovered_tools[0]).await;
+            
+            // Merge: provided args override extracted args
+            if let (Some(provided_obj), Some(extracted_obj)) = (provided.as_object_mut(), extracted.as_object()) {
+                for (key, value) in extracted_obj {
+                    // Only add if not already provided
+                    if !provided_obj.contains_key(key) {
+                        provided_obj.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            
+            provided
         } else {
-            // Try to extract arguments from the query using the tool's guidance
+            // No provided args, extract everything from query
             self.extract_arguments_from_query(query, &tool.tool_slug, &discovered_tools[0]).await
         };
         

@@ -273,6 +273,7 @@ impl Agent {
             config.api_key.as_deref(),
             config,
             None, // Agent struct doesn't have provider yet
+            None, // Agent struct doesn't have model yet
         )
         .await;
 

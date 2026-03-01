@@ -384,6 +384,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
         None, // Gateway doesn't have provider yet
+        Some(model.clone()),
     )
     .await;
     let tools_registry: Arc<Vec<ToolSpec>> =

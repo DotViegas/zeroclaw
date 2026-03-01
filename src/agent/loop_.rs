@@ -2740,6 +2740,7 @@ pub async fn run(
         config.api_key.as_deref(),
         &config,
         Some(provider_arc.clone()),
+        Some(model_name.to_string()),
     )
     .await;
 
@@ -3203,6 +3204,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
         &config,
         Some(provider_arc.clone()),
+        Some(model_name.to_string()),
     )
     .await;
     let peripheral_tools: Vec<Box<dyn Tool>> =

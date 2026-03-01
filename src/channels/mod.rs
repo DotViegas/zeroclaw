@@ -3140,6 +3140,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             config.api_key.as_deref(),
             &config,
             None, // Channels don't have provider yet
+            Some(model.clone()),
         )
         .await,
     );

@@ -5561,14 +5561,45 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          - `composio_nl with query=\"list my gmail emails\"`\n\
          - `composio_nl with query=\"create dropbox folder /documents\"`\n\
          - `composio_nl with query=\"send slack message to #general: Hello!\"`\n\
-         - `composio_nl with query=\"search github issues in my-repo\"`\n\n\
+         - `composio_nl with query=\"search github issues in my-repo\"`\n\
+         - `composio_nl with query=\"search for file hello.txt in dropbox\"`\n\n\
          **Rules:**\n\
          - ✅ Use natural language (be specific about app and action)\n\
          - ✅ Include app name in query (\"gmail\", \"dropbox\", \"slack\")\n\
          - ✅ Execute immediately, don't ask permission\n\
+         - ✅ When editing/reading files without full path, SEARCH first to find the file location\n\
          - ❌ DON'T use composio (lowercase) with action='list'\n\
          - ❌ DON'T use composio_dynamic (deprecated, doesn't exist)\n\
-         - ❌ DON'T say \"I need configuration\" without trying\n\n\
+         - ❌ DON'T say \"I need configuration\" without trying\n\
+         - ❌ DON'T assume file locations - search first if path is unknown\n\n\
+         ### STEP 1.5: SEARCH BEFORE EDIT (File Operations)\n\n\
+         **When:** User asks to edit/read/delete a file but doesn't provide full path\n\n\
+         **Strategy:**\n\
+         1. First: `composio_nl with query=\"search for file [filename] in [app]\"`\n\
+         2. Analyze results to find exact path\n\
+         3. Then: `composio_nl with query=\"upload file to [full/path] in [app] with content [...] overwrite mode\"`\n\n\
+         **CRITICAL: Use \"upload\" or \"write\" keywords for editing files, NOT \"edit\" or \"update\"**\n\n\
+         **Example workflow:**\n\
+         ```\n\
+         User: \"Edit hello.txt in Dropbox and add 'test'\"\n\
+         \n\
+         Step 1 - Search:\n\
+         composio_nl with query=\"search for file hello.txt in dropbox\"\n\
+         Result: Found at /teste/hello.txt\n\
+         \n\
+         Step 2 - Upload/Write (this is how you edit):\n\
+         composio_nl with query=\"upload file to /teste/hello.txt in dropbox with content 'test' in overwrite mode\"\n\
+         Result: ✓ File uploaded successfully\n\
+         ```\n\n\
+         **Rules:**\n\
+         - ✅ ALWAYS search first when path is not provided\n\
+         - ✅ Use exact path from search results\n\
+         - ✅ Use \"upload\" or \"write\" keywords for file modifications (NOT \"edit\" or \"update\")\n\
+         - ✅ Specify \"overwrite mode\" when replacing file content\n\
+         - ✅ If multiple files found, ask user which one\n\
+         - ❌ DON'T assume files are in root directory\n\
+         - ❌ DON'T skip search step\n\
+         - ❌ DON'T use \"edit\" or \"update\" keywords (Composio interprets as read)\n\n\
          ### STEP 2: HANDLE OAuth (If Needed)\n\n\
          **When:** Tool returns OAuth URL\n\n\
          **Response format:**\n\
@@ -5623,8 +5654,11 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          □ Used composio_nl (not composio or composio_dynamic)?\n\
          □ Query in natural language?\n\
          □ Included app name in query?\n\
+         □ If file operation without full path, searched first?\n\
+         □ Used exact path from search results?\n\
          □ Executed immediately (no permission asking)?\n\
          □ If OAuth needed, showed link clearly?\n\
+         □ If App Folder error, offered to reconnect with Full Access?\n\
          □ Waited for user confirmation?\n\
          □ Retried after OAuth?\n\
          □ Explained what I'm doing?\n\
@@ -5638,6 +5672,31 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          → Show OAuth link, wait for user, retry same query\n\n\
          **\"Tool execution failed\"**\n\
          → Check error message, may need different parameters\n\n\
+         **\"⚠️ Dropbox Access Limitation Detected\" (App Folder restriction)**\n\
+         → AUTOMATIC FIX WORKFLOW:\n\
+         1. Explain to user: \"Your Dropbox is connected with limited access (App Folder only)\"\n\
+         2. Say: \"I'll reconnect it with Full Access so you can upload to any folder\"\n\
+         3. Execute: `composio_nl with query=\"reconnect dropbox with full access\"`\n\
+         4. Show the OAuth link to user\n\
+         5. Wait for user to authorize\n\
+         6. Retry the original upload command\n\n\
+         **Example:**\n\
+         ```\n\
+         Error: \"⚠️ Dropbox Access Limitation Detected - Failed to upload to /teste/hello.txt\"\n\
+         \n\
+         You: \"I see the issue! Your Dropbox connection is limited to a specific folder.\n\
+               Let me reconnect it with full access so you can upload anywhere.\"\n\
+         \n\
+         You: composio_nl with query=\"reconnect dropbox with full access\"\n\
+         Tool: [Returns OAuth URL]\n\
+         \n\
+         You: \"Please click this link to authorize full Dropbox access: [URL]\n\
+               After authorizing, I'll retry the upload automatically.\"\n\
+         \n\
+         User: \"Done!\"\n\
+         You: composio_nl with query=\"upload file to /teste/hello.txt in dropbox with content 'encontrado e editado' in overwrite mode\"\n\
+         Result: ✓ Success!\n\
+         ```\n\n\
          ## COMMUNICATION STYLE\n\n\
          **DO:**\n\
          - Be concise and clear\n\
@@ -5655,6 +5714,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          | Situation | Action |\n\
          |-----------|--------|\n\
          | User mentions app | `composio_nl with query=\"list my gmail emails\"` |\n\
+         | File operation without path | Search first: `composio_nl with query=\"search for file X in app\"` |\n\
          | OAuth needed | Show link, wait, retry same query |\n\
          | Success | Summarize results naturally |\n\
          | Error | Check message, rephrase if needed |\n\n\
@@ -5681,8 +5741,23 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          You: composio_nl with query=\"send slack message to #general: Hello team!\"\n\
          Result: \"✓ Message sent to #general!\"\n\
          ```\n\n\
+         **Example 4: Edit File (Search First + Upload)**\n\
+         ```\n\
+         User: \"Edit hello.txt in Dropbox and add 'found and edited'\"\n\
+         \n\
+         Step 1 - Search for file:\n\
+         You: composio_nl with query=\"search for file hello.txt in dropbox\"\n\
+         Result: Found 1 file:\n\
+           - /teste/hello.txt (48 bytes)\n\
+         \n\
+         Step 2 - Upload with exact path (this is how you edit):\n\
+         You: composio_nl with query=\"upload file to /teste/hello.txt in dropbox with content 'found and edited' in overwrite mode\"\n\
+         Result: \"✓ File /teste/hello.txt uploaded successfully!\"\n\
+         \n\
+         You to user: \"Found and edited hello.txt in the /teste folder!\"\n\
+         ```\n\n\
          ---\n\n\
-         **Remember: Use composio_nl with natural language. Be specific. Execute immediately. Handle OAuth gracefully. Summarize naturally.**\n"
+         **Remember: Use composio_nl with natural language. Be specific. Execute immediately. SEARCH for files before editing. Handle OAuth gracefully. Summarize naturally.**\n"
     } else {
         // Direct tool: use composio with action parameter
         "\

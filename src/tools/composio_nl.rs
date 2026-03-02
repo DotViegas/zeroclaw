@@ -1531,6 +1531,11 @@ impl Tool for ComposioNaturalLanguageTool {
                     Examples: 'list my gmail emails', 'create github issue in my-repo', \
                     'send slack message to #general'"
                 },
+                "tool_slug": {
+                    "type": "string",
+                    "description": "Optional: Exact Composio tool name to bypass search (e.g., 'DROPBOX_GET_TEMPORARY_LINK'). \
+                    If you know the exact tool, use this to force its execution and avoid semantic search errors."
+                },
                 "arguments": {
                     "type": "object",
                     "description": "Optional: Specific arguments if you know them. \
@@ -1575,15 +1580,36 @@ impl Tool for ComposioNaturalLanguageTool {
             }
         };
         
-        // 2. Search for relevant tools
-        let discovered_tools = match self.search_tools(query).await {
-            Ok(tools) => tools,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to search tools: {}", e)),
-                });
+        let optional_tool_slug = args.get("tool_slug").and_then(|t| t.as_str());
+        
+        // 2. Search for relevant tools or use the exact one provided
+        let discovered_tools = if let Some(slug) = optional_tool_slug {
+            tracing::info!(tool_slug = slug, "Bypassing search, using provided tool slug");
+            
+            // Try to fetch complete schema
+            let schemas_map = self.get_tool_schemas(vec![slug.to_string()]).await.unwrap_or_default();
+            
+            // Infer toolkit from prefix (e.g., GMAIL_SEND_EMAIL -> gmail)
+            let toolkit = slug.split('_').next().unwrap_or("unknown").to_lowercase();
+            
+            vec![DiscoveredTool {
+                tool_slug: slug.to_string(),
+                description: format!("Direct execution of {}", slug),
+                toolkit,
+                use_case: query.to_string(),
+                input_schema: schemas_map.get(slug).cloned(),
+                schema_ref: None,
+            }]
+        } else {
+            match self.search_tools(query).await {
+                Ok(tools) => tools,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to search tools: {}", e)),
+                    });
+                }
             }
         };
         

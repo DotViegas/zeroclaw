@@ -261,6 +261,9 @@ pub struct JsonRpcError {
 mod tests {
     use super::*;
 
+    // Feature: composio-permanent-integration
+    // Task 30.2: Unit tests for MCP client (call, list_tools, health_check)
+
     #[test]
     fn test_find_double_newline() {
         let buf = b"event: message\ndata: {}\n\n";
@@ -274,6 +277,18 @@ mod tests {
     }
 
     #[test]
+    fn test_find_double_newline_multiple_occurrences() {
+        let buf = b"data: first\n\ndata: second\n\n";
+        assert_eq!(find_double_newline(buf), Some(11)); // First occurrence
+    }
+
+    #[test]
+    fn test_find_double_newline_at_end() {
+        let buf = b"data: test\n\n";
+        assert_eq!(find_double_newline(buf), Some(10));
+    }
+
+    #[test]
     fn test_jsonrpc_request_serialization() {
         let req = JsonRpcRequest::new(1, "test/method", serde_json::json!({"key": "value"}));
         let json = serde_json::to_string(&req).unwrap();
@@ -281,5 +296,172 @@ mod tests {
         assert!(json.contains("\"jsonrpc\":\"2.0\""));
         assert!(json.contains("\"id\":1"));
         assert!(json.contains("\"method\":\"test/method\""));
+    }
+
+    #[test]
+    fn test_jsonrpc_request_with_empty_params() {
+        let req = JsonRpcRequest::new(42, "empty/method", serde_json::json!({}));
+        let json = serde_json::to_string(&req).unwrap();
+        
+        assert!(json.contains("\"jsonrpc\":\"2.0\""));
+        assert!(json.contains("\"id\":42"));
+        assert!(json.contains("\"method\":\"empty/method\""));
+        assert!(json.contains("\"params\":{}"));
+    }
+
+    #[test]
+    fn test_jsonrpc_request_with_array_params() {
+        let req = JsonRpcRequest::new(3, "array/method", serde_json::json!([1, 2, 3]));
+        let json = serde_json::to_string(&req).unwrap();
+        
+        assert!(json.contains("\"jsonrpc\":\"2.0\""));
+        assert!(json.contains("\"id\":3"));
+        assert!(json.contains("\"params\":[1,2,3]"));
+    }
+
+    #[test]
+    fn test_jsonrpc_response_deserialization_success() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"ok"}}"#;
+        let response: JsonRpcResponse = serde_json::from_str(json).unwrap();
+        
+        assert_eq!(response.jsonrpc, Some("2.0".to_string()));
+        assert_eq!(response.id, Some(1));
+        assert!(response.result.is_some());
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_response_deserialization_error() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
+        let response: JsonRpcResponse = serde_json::from_str(json).unwrap();
+        
+        assert_eq!(response.jsonrpc, Some("2.0".to_string()));
+        assert_eq!(response.id, Some(1));
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        
+        let error = response.error.unwrap();
+        assert_eq!(error.code, -32600);
+        assert_eq!(error.message, "Invalid Request");
+    }
+
+    #[test]
+    fn test_jsonrpc_response_deserialization_with_error_data() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params","data":{"field":"missing"}}}"#;
+        let response: JsonRpcResponse = serde_json::from_str(json).unwrap();
+        
+        let error = response.error.unwrap();
+        assert_eq!(error.code, -32602);
+        assert_eq!(error.message, "Invalid params");
+        assert!(error.data.is_some());
+    }
+
+    #[test]
+    fn test_jsonrpc_response_deserialization_minimal() {
+        // Minimal valid response (optional fields missing)
+        let json = r#"{"id":1,"result":null}"#;
+        let response: JsonRpcResponse = serde_json::from_str(json).unwrap();
+        
+        assert_eq!(response.id, Some(1));
+        assert!(response.result.is_some());
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn test_mcp_client_creation() {
+        let client = McpClient::new("https://mcp.composio.dev", "test_api_key");
+        assert!(client.is_ok());
+        
+        let client = client.unwrap();
+        assert_eq!(client.mcp_url, "https://mcp.composio.dev");
+        assert_eq!(client.api_key, "test_api_key");
+        assert_eq!(client.timeout, Duration::from_secs(180));
+    }
+
+    #[test]
+    fn test_mcp_client_with_custom_timeout() {
+        let client = McpClient::new("https://mcp.composio.dev", "test_api_key")
+            .unwrap()
+            .with_timeout(Duration::from_secs(60));
+        
+        assert_eq!(client.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_mcp_client_headers() {
+        let client = McpClient::new("https://mcp.composio.dev", "test_api_key").unwrap();
+        let headers = client.headers().unwrap();
+        
+        assert_eq!(headers.get("x-api-key").unwrap(), "test_api_key");
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert!(headers.get("accept").is_some());
+    }
+
+    #[test]
+    fn test_mcp_client_headers_with_special_characters() {
+        let client = McpClient::new("https://mcp.composio.dev", "key_with_special!@#").unwrap();
+        let headers = client.headers();
+        
+        // Should handle special characters in API key
+        assert!(headers.is_ok());
+    }
+
+    #[test]
+    fn test_jsonrpc_request_id_uniqueness() {
+        let req1 = JsonRpcRequest::new(1, "method1", serde_json::json!({}));
+        let req2 = JsonRpcRequest::new(2, "method2", serde_json::json!({}));
+        
+        assert_ne!(req1.id, req2.id);
+    }
+
+    #[test]
+    fn test_jsonrpc_request_method_names() {
+        let methods = vec!["initialize", "tools/list", "tools/call", "tools/get"];
+        
+        for (idx, method) in methods.iter().enumerate() {
+            let req = JsonRpcRequest::new(idx as i64, *method, serde_json::json!({}));
+            assert_eq!(req.method, *method);
+        }
+    }
+
+    #[test]
+    fn test_jsonrpc_error_deserialization_standard_codes() {
+        // Test standard JSON-RPC error codes
+        let error_codes = vec![
+            (-32700, "Parse error"),
+            (-32600, "Invalid Request"),
+            (-32601, "Method not found"),
+            (-32602, "Invalid params"),
+            (-32603, "Internal error"),
+        ];
+        
+        for (code, message) in error_codes {
+            let json = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":{},"message":"{}"}}}}"#,
+                code, message
+            );
+            let response: JsonRpcResponse = serde_json::from_str(&json).unwrap();
+            
+            let error = response.error.unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn test_mcp_client_timeout_configuration() {
+        let timeouts = vec![
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(180),
+            Duration::from_secs(300),
+        ];
+        
+        for timeout in timeouts {
+            let client = McpClient::new("https://mcp.composio.dev", "test_key")
+                .unwrap()
+                .with_timeout(timeout);
+            assert_eq!(client.timeout, timeout);
+        }
     }
 }

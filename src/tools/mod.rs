@@ -19,6 +19,7 @@ pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
 pub mod composio;
+pub mod composio_rest;
 pub mod composio_meta;
 pub mod composio_mcp;
 pub mod composio_nl;
@@ -44,7 +45,6 @@ pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
-pub mod office_edit;
 pub mod pdf_read;
 pub mod proxy_config;
 pub mod pushover;
@@ -57,7 +57,7 @@ pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
-pub use composio::ComposioTool;
+pub use composio_rest::ComposioTool;
 pub use composio_mcp::ComposioMcpTool;
 pub use composio_nl::ComposioNaturalLanguageTool;
 pub use content_search::ContentSearchTool;
@@ -82,7 +82,6 @@ pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
-pub use office_edit::OfficeEditTool;
 pub use pdf_read::PdfReadTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -136,7 +135,7 @@ impl Tool for ArcDelegatingTool {
     }
 }
 
-fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
+pub fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
 
@@ -158,6 +157,130 @@ pub fn default_tools_with_runtime(
         Box::new(GlobSearchTool::new(security.clone())),
         Box::new(ContentSearchTool::new(security)),
     ]
+}
+
+/// Load Composio tools with automatic pattern selection.
+///
+/// This is the single entry point for loading Composio tools. It automatically
+/// selects the appropriate pattern based on configuration:
+/// - Pattern 2 (MCP meta-tools): When MCP is enabled
+/// - Pattern 1 (direct REST tools): When MCP disabled but API key exists
+/// - No tools: When Composio is disabled
+///
+/// # Arguments
+/// * `config` - Full Composio configuration
+/// * `security` - Security policy for access control
+/// * `provider` - Optional LLM provider for intelligent parameter extraction
+/// * `model` - Optional model name for LLM provider
+///
+/// # Returns
+/// Vector of Arc-wrapped tools ready to be added to the tool registry
+pub async fn load_composio_tools(
+    config: &crate::config::ComposioConfig,
+    security: Arc<SecurityPolicy>,
+    provider: Option<Arc<dyn crate::providers::Provider>>,
+    model: Option<String>,
+) -> Vec<Arc<dyn Tool>> {
+    // Auto-migrate configuration if needed
+    let config = config.auto_migrate();
+    
+    // Pattern selection logic - PRIORITIZES Pattern 2 (MCP) over Pattern 1 (REST)
+    // Pattern 2 (MCP meta-tools) is the recommended approach for dynamic tool discovery
+    
+    if !config.enabled {
+        // Composio disabled - return empty tool list
+        tracing::debug!("Composio integration is disabled in configuration");
+        return Vec::new();
+    }
+
+    if config.mcp.enabled {
+        // Pattern 2: MCP-first with meta tools (RECOMMENDED)
+        tracing::info!("Loading Composio tools using Pattern 2 (MCP meta-tools) - recommended approach");
+        
+        let (user_id, is_legacy) = config.effective_user_id();
+        if is_legacy {
+            tracing::warn!(
+                "Using legacy entity_id field. Please migrate to user_id in config.toml"
+            );
+            eprintln!(
+                "⚠ WARNING: Using legacy entity_id field. Please migrate to user_id in config.toml"
+            );
+        }
+
+        if let Some(api_key) = &config.api_key {
+            match load_composio_mcp_tools(
+                &config.mcp,
+                api_key,
+                &user_id,
+                security,
+                provider,
+                model,
+            )
+            .await
+            {
+                Ok(tools) => {
+                    tracing::info!(
+                        tool_count = tools.len(),
+                        "Successfully loaded Composio tools using Pattern 2 (MCP)"
+                    );
+                    tools
+                },
+                Err(e) => {
+                    // Graceful degradation: Log warning and continue without Composio tools
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to load Composio MCP tools. Agent will continue without Composio integration."
+                    );
+                    eprintln!("⚠ Failed to load Composio MCP tools: {}", e);
+                    eprintln!("  Agent will continue operating with reduced functionality.");
+                    eprintln!("  Check Composio API connectivity and configuration.");
+                    Vec::new()
+                }
+            }
+        } else {
+            tracing::warn!("Composio MCP enabled but no API key provided");
+            eprintln!("⚠ Composio MCP enabled but no API key provided");
+            Vec::new()
+        }
+    } else if let Some(api_key) = &config.api_key {
+        // Pattern 1: REST API fallback (DEPRECATED)
+        if !api_key.is_empty() {
+            let (user_id, _) = config.effective_user_id();
+            tracing::warn!(
+                "Using deprecated Composio Pattern 1 (REST API). Consider enabling MCP for Pattern 2 (meta-tools)."
+            );
+            eprintln!("\n╔════════════════════════════════════════════════════════════════╗");
+            eprintln!("║  ⚠️  DEPRECATION WARNING: Composio Pattern 1 (REST API)      ║");
+            eprintln!("╠════════════════════════════════════════════════════════════════╣");
+            eprintln!("║  Pattern 1 (REST API) is DEPRECATED and will be removed in    ║");
+            eprintln!("║  a future version. Please migrate to Pattern 2 (MCP) for:     ║");
+            eprintln!("║                                                                ║");
+            eprintln!("║  ✓ Dynamic tool discovery (1000+ tools)                       ║");
+            eprintln!("║  ✓ Natural language queries                                   ║");
+            eprintln!("║  ✓ Simplified OAuth handling                                  ║");
+            eprintln!("║  ✓ Better error messages                                      ║");
+            eprintln!("║                                                                ║");
+            eprintln!("║  Migration steps:                                             ║");
+            eprintln!("║  1. Add [composio.mcp] section to config.toml                 ║");
+            eprintln!("║  2. Set enabled=true                                          ║");
+            eprintln!("║  3. Add server_id or mcp_url from Composio dashboard          ║");
+            eprintln!("║                                                                ║");
+            eprintln!("║  See: docs/composio-migration.md for detailed guide           ║");
+            eprintln!("╚════════════════════════════════════════════════════════════════╝\n");
+            vec![Arc::new(ComposioTool::new(
+                api_key,
+                Some(&user_id),
+                security,
+            )) as Arc<dyn Tool>]
+        } else {
+            Vec::new()
+        }
+    } else {
+        // Composio enabled but no configuration provided
+        tracing::warn!("Composio enabled but no API key or MCP configuration provided");
+        eprintln!("⚠ Composio enabled but no API key or MCP configuration provided");
+        Vec::new()
+    }
 }
 
 /// Load Composio MCP tools dynamically from the MCP server
@@ -240,10 +363,26 @@ pub async fn load_composio_mcp_tools(
         anyhow::bail!("MCP configuration requires either mcp_url or server_id");
     };
 
-    // Fetch available tools from MCP server
-    let mcp_tools: Vec<McpTool> = client.list_tools().await?;
+    // Fetch available tools from MCP server with graceful degradation
+    let mcp_tools: Vec<McpTool> = match client.list_tools().await {
+        Ok(tools) => tools,
+        Err(e) => {
+            // Graceful degradation: MCP server unreachable
+            tracing::warn!(
+                error = %e,
+                mcp_url = mcp_config.mcp_url.as_deref(),
+                server_id = mcp_config.server_id.as_deref(),
+                "MCP server unreachable. Agent will continue without Composio integration."
+            );
+            eprintln!("⚠ MCP server unreachable: {}", e);
+            eprintln!("  Agent will continue without Composio integration.");
+            eprintln!("  Check Composio API connectivity and configuration.");
+            return Ok(Vec::new());
+        }
+    };
 
     if mcp_tools.is_empty() {
+        tracing::warn!("Composio MCP server returned no tools");
         eprintln!("Warning: Composio MCP server returned no tools. Check your MCP configuration.");
         return Ok(Vec::new());
     }
@@ -309,14 +448,19 @@ pub async fn load_composio_mcp_tools(
     }
 
     // Pattern 1: Direct app tools
+    tracing::warn!(
+        tool_count = mcp_tools.len(),
+        "Composio Pattern 1 detected via MCP: using direct app tools (not recommended)"
+    );
+    eprintln!("\n⚠️  WARNING: Composio Pattern 1 detected via MCP server");
+    eprintln!("   Your MCP server is configured to return direct app tools instead of meta-tools.");
+    eprintln!("   For better functionality, reconfigure your MCP server to use Pattern 2 (meta-tools).");
+    eprintln!("   Pattern 2 provides dynamic tool discovery and natural language queries.");
+    eprintln!("   See: docs/composio-migration.md for migration guide\n");
     eprintln!(
         "Info: Loaded {} tools from Composio MCP server (cache TTL: {}s)",
         mcp_tools.len(),
         mcp_config.tools_cache_ttl_secs
-    );
-    tracing::info!(
-        tool_count = mcp_tools.len(),
-        "Composio Pattern 1 detected: using direct app tools"
     );
 
     // Create onboarding handler based on UI mode
@@ -324,7 +468,7 @@ pub async fn load_composio_mcp_tools(
         use crate::composio::{CliOnboarding, ComposioRestClient, OnboardingUx, ServerOnboarding};
 
         // Create REST client for onboarding
-        let rest_client = Arc::new(ComposioRestClient::new(api_key.to_string()));
+        let rest_client = Arc::new(ComposioRestClient::new(api_key.to_string(), user_id.to_string()));
 
         // Determine UI mode from environment
         let ui_mode = std::env::var("ZEROCLAW_UI_MODE")
@@ -364,6 +508,135 @@ pub async fn load_composio_mcp_tools(
         .collect();
 
     Ok(tools)
+}
+/// Refresh Composio tools without agent restart
+///
+/// This function reloads Composio tools from the MCP server or REST API,
+/// invalidating caches and fetching fresh tool lists. It enables hot reload
+/// of the tool registry without requiring agent restart.
+///
+/// # Arguments
+/// * `config` - Composio configuration
+/// * `security` - Security policy for tool execution
+/// * `provider` - Optional LLM provider for natural language tool
+/// * `model` - Optional model name for natural language tool
+///
+/// # Returns
+/// Vector of refreshed Arc-wrapped tools
+///
+/// # Behavior
+/// - Invalidates all tool caches (tool list, schemas, connections)
+/// - Fetches fresh tool list from MCP server or REST API
+/// - Recreates tool instances with clean state
+/// - Maintains same pattern selection logic as load_composio_tools
+/// - Gracefully degrades on failure (returns empty vec, logs warning)
+///
+/// # Example
+/// ```no_run
+/// use std::sync::Arc;
+/// use zeroclaw::tools::refresh_composio_tools;
+/// use zeroclaw::security::SecurityPolicy;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let config = /* load config */;
+/// let security = Arc::new(SecurityPolicy::default());
+/// let refreshed_tools = refresh_composio_tools(&config, security, None, None).await;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn refresh_composio_tools(
+    config: &crate::config::ComposioConfig,
+    security: Arc<SecurityPolicy>,
+    provider: Option<Arc<dyn crate::providers::Provider>>,
+    model: Option<String>,
+) -> Vec<Arc<dyn Tool>> {
+    tracing::info!("Refreshing Composio tools (hot reload)");
+    eprintln!("🔄 Refreshing Composio tools...");
+
+    // Invalidate caches before reloading
+    // Note: Cache invalidation happens implicitly by creating new client instances
+    // with fresh cache state. The old client instances will be dropped when tools
+    // are replaced in the registry.
+
+    // Use the same pattern selection logic as load_composio_tools
+    if config.mcp.enabled {
+        // Pattern 2: MCP-first with meta tools
+        let (user_id, is_legacy) = config.effective_user_id();
+        if is_legacy {
+            eprintln!(
+                "WARNING: Using legacy entity_id field. Please migrate to user_id in config.toml"
+            );
+        }
+
+        if let Some(api_key) = &config.api_key {
+            // Force cache refresh by creating new MCP client with zero TTL temporarily
+            let mut mcp_config_refresh = config.mcp.clone();
+            // Set TTL to 0 to force immediate refresh, then restore original TTL
+            let original_ttl = mcp_config_refresh.tools_cache_ttl_secs;
+            mcp_config_refresh.tools_cache_ttl_secs = 0;
+
+            match load_composio_mcp_tools(
+                &mcp_config_refresh,
+                api_key,
+                &user_id,
+                security.clone(),
+                provider.clone(),
+                model.clone(),
+            )
+            .await
+            {
+                Ok(tools) => {
+                    eprintln!("✓ Successfully refreshed {} Composio tool(s)", tools.len());
+                    tracing::info!(
+                        tool_count = tools.len(),
+                        "Composio tools refreshed successfully"
+                    );
+
+                    // Restore original TTL for subsequent operations
+                    // Note: This is informational only; the actual TTL is set in the client
+                    tracing::debug!(
+                        original_ttl = original_ttl,
+                        "Tool cache TTL will be restored on next load"
+                    );
+
+                    tools
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to refresh Composio MCP tools. Keeping existing tools."
+                    );
+                    eprintln!("⚠ Failed to refresh Composio MCP tools: {}", e);
+                    eprintln!("  Existing tools will remain active.");
+                    Vec::new()
+                }
+            }
+        } else {
+            tracing::warn!("Composio MCP enabled but no API key provided");
+            eprintln!("⚠ Composio MCP enabled but no API key provided");
+            Vec::new()
+        }
+    } else if let Some(api_key) = &config.api_key {
+        // Pattern 1: REST API fallback (deprecated)
+        if !api_key.is_empty() {
+            let (user_id, _) = config.effective_user_id();
+            eprintln!(
+                "Info: Refreshing Composio Pattern 1 (REST API). Consider enabling MCP for Pattern 2."
+            );
+            tracing::info!("Refreshing Composio REST API tool");
+            vec![Arc::new(ComposioTool::new(
+                api_key,
+                Some(&user_id),
+                security,
+            )) as Arc<dyn Tool>]
+        } else {
+            Vec::new()
+        }
+    } else {
+        // Composio disabled
+        tracing::debug!("Composio disabled, no tools to refresh");
+        Vec::new()
+    }
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -410,7 +683,7 @@ pub async fn all_tools_with_runtime(
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
-    composio_entity_id: Option<&str>,
+    _composio_entity_id: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
     workspace_dir: &std::path::Path,
@@ -501,42 +774,9 @@ pub async fn all_tools_with_runtime(
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
-    // Office file editing (feature-gated at compile time via office-edit)
-    // Requires Composio API key for staging binary files
-    #[cfg(feature = "office-edit")]
-    if let Some(api_key) = composio_key {
-        tool_arcs.push(Arc::new(OfficeEditTool::new(
-            security.clone(),
-            api_key.to_string(),
-        )));
-    }
-
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
-
-    // Add Composio tool (REST API) - only if MCP Pattern 2 is not active
-    // Pattern 2 provides composio_nl which is more powerful
-    let should_load_rest_composio = if let Some(key) = composio_key {
-        if !key.is_empty() {
-            // Check if MCP is enabled - if so, we'll load MCP tools instead
-            !root_config.composio.mcp.enabled
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    if should_load_rest_composio {
-        if let Some(key) = composio_key {
-            tool_arcs.push(Arc::new(ComposioTool::new(
-                key,
-                composio_entity_id,
-                security.clone(),
-            )));
-        }
-    }
 
     // Add delegation tool when agents are configured
     if !agents.is_empty() {
@@ -568,31 +808,23 @@ pub async fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(delegate_tool));
     }
 
-    // Load Composio MCP tools if configured
+    // Load Composio tools with automatic pattern selection
     if let Some(key) = composio_key {
-        if !key.is_empty() && root_config.composio.mcp.enabled {
-            match load_composio_mcp_tools(
-                &root_config.composio.mcp,
-                key,
-                composio_entity_id.unwrap_or(&root_config.composio.entity_id),
+        if !key.is_empty() && root_config.composio.enabled {
+            match load_composio_tools(
+                &root_config.composio,
                 security.clone(),
                 provider.clone(),
                 model.clone(),
             )
             .await
             {
-                Ok(mcp_tools) => {
-                    if !mcp_tools.is_empty() {
-                        eprintln!(
-                            "✓ Loaded {} Composio MCP tools",
-                            mcp_tools.len()
-                        );
-                        tool_arcs.extend(mcp_tools);
-                    }
+                tools if !tools.is_empty() => {
+                    eprintln!("✓ Loaded {} Composio tool(s)", tools.len());
+                    tool_arcs.extend(tools);
                 }
-                Err(e) => {
-                    eprintln!("⚠ Failed to load Composio MCP tools: {}", e);
-                    eprintln!("  Continuing with direct Composio tool only.");
+                _ => {
+                    eprintln!("⚠ No Composio tools loaded");
                 }
             }
         }
@@ -654,6 +886,8 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None, // provider
+            None, // model
         )
         .await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -696,6 +930,8 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None, // provider
+            None, // model
         )
         .await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -846,6 +1082,8 @@ mod tests {
             &agents,
             Some("delegate-test-credential"),
             &cfg,
+            None, // provider
+            None, // model
         )
         .await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -879,6 +1117,8 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            None, // provider
+            None, // model
         )
         .await;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();

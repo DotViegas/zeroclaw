@@ -1,3 +1,6 @@
+use crate::config::composio::ComposioConfig;
+#[cfg(test)]
+use crate::config::composio::{ComposioSecurityConfig, CostTrackingConfig, McpConfig as ComposioMcpConfig, OnboardingMode};
 use crate::config::traits::ChannelConfig;
 use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::{AutonomyLevel, DomainMatcher};
@@ -827,116 +830,11 @@ impl Default for GatewayConfig {
 
 // ── Composio (managed tool surface) ─────────────────────────────
 
-/// Composio managed OAuth tools integration (`[composio]` section).
-///
-/// Provides access to 1000+ OAuth-connected tools via the Composio platform.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ComposioConfig {
-    /// Enable Composio integration for 1000+ OAuth tools
-    #[serde(default, alias = "enable")]
-    pub enabled: bool,
-    /// Composio API key (stored encrypted when secrets.encrypt = true)
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Default entity ID for multi-user setups
-    #[serde(default = "default_entity_id")]
-    pub entity_id: String,
-    /// MCP (Model Context Protocol) integration configuration
-    #[serde(default)]
-    pub mcp: ComposioMcpConfig,
-}
+// ── Composio Integration ────────────────────────────────────────
 
-/// Composio MCP integration configuration (`[composio.mcp]` section).
-///
-/// Enables seamless access to Composio tools via MCP protocol.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ComposioMcpConfig {
-    /// Enable MCP integration (auto-configured during onboard)
-    #[serde(default)]
-    pub enabled: bool,
-    /// MCP server ID (created during onboard or via Composio dashboard)
-    #[serde(default)]
-    pub server_id: Option<String>,
-    /// User ID for MCP instance (defaults to composio.entity_id)
-    #[serde(default)]
-    pub user_id: Option<String>,
-    /// Optional separate API key for MCP (if different from composio.api_key)
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Toolkits enabled in MCP server (e.g., ["gmail", "dropbox", "github"])
-    #[serde(default)]
-    pub toolkits: Vec<String>,
-    /// Auth config IDs per toolkit (for reference)
-    #[serde(default)]
-    pub auth_configs: std::collections::HashMap<String, String>,
-    /// Generated MCP URL (cached for performance, recommended over server_id)
-    #[serde(default)]
-    pub mcp_url: Option<String>,
-    /// TTL for tools list cache in seconds (default: 600 = 10 minutes)
-    #[serde(default = "default_tools_cache_ttl")]
-    pub tools_cache_ttl_secs: u64,
-    /// Onboarding mode for OAuth connections
-    #[serde(default)]
-    pub onboarding_mode: OnboardingMode,
-    /// Callback base URL for web-based OAuth (mode: web_callback)
-    #[serde(default)]
-    pub callback_base_url: Option<String>,
-    /// Local callback listen address (mode: cli_callback_local)
-    #[serde(default)]
-    pub callback_listen_addr: Option<String>,
-}
-
-fn default_tools_cache_ttl() -> u64 {
-    600 // 10 minutes
-}
-
-/// Onboarding mode for OAuth connections
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum OnboardingMode {
-    /// CLI: auto-open browser (default)
-    #[default]
-    CliAutoOpen,
-    /// CLI: print link only
-    CliPrintOnly,
-    /// CLI: local callback server
-    CliCallbackLocal,
-    /// Web: return redirect URL to caller
-    WebCallback,
-}
-
-impl Default for ComposioMcpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            server_id: None,
-            user_id: None,
-            api_key: None,
-            toolkits: Vec::new(),
-            auth_configs: std::collections::HashMap::new(),
-            mcp_url: None,
-            tools_cache_ttl_secs: default_tools_cache_ttl(),
-            onboarding_mode: OnboardingMode::default(),
-            callback_base_url: None,
-            callback_listen_addr: None,
-        }
-    }
-}
-
-fn default_entity_id() -> String {
-    "default".into()
-}
-
-impl Default for ComposioConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: None,
-            entity_id: default_entity_id(),
-            mcp: ComposioMcpConfig::default(),
-        }
-    }
-}
+// Composio configuration types are now defined in src/config/composio.rs
+// and re-exported from src/config/mod.rs for backward compatibility.
+// See: ComposioConfig, McpConfig, ComposioSecurityConfig, OnboardingMode
 
 // ── Secrets (encrypted credential store) ────────────────────────
 
@@ -5706,7 +5604,7 @@ default_temperature = 0.7
         let c = ComposioConfig::default();
         assert!(!c.enabled, "Composio must be disabled by default");
         assert!(c.api_key.is_none(), "No API key by default");
-        assert_eq!(c.entity_id, "default");
+        assert_eq!(c.user_id, "default_user");
     }
 
     #[test]
@@ -5714,14 +5612,19 @@ default_temperature = 0.7
         let c = ComposioConfig {
             enabled: true,
             api_key: Some("comp-key-123".into()),
-            entity_id: "user42".into(),
+            user_id: "user42".into(),
+            entity_id: None,
             mcp: ComposioMcpConfig::default(),
+            tools_cache_ttl_secs: 3600,
+            onboarding_mode: OnboardingMode::default(),
+            security: ComposioSecurityConfig::default(),
+            cost_tracking: CostTrackingConfig::default(),
         };
         let toml_str = toml::to_string(&c).unwrap();
         let parsed: ComposioConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.api_key.as_deref(), Some("comp-key-123"));
-        assert_eq!(parsed.entity_id, "user42");
+        assert_eq!(parsed.user_id, "user42");
     }
 
     #[test]
@@ -5747,7 +5650,7 @@ enabled = true
         let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.enabled);
         assert!(parsed.api_key.is_none());
-        assert_eq!(parsed.entity_id, "default");
+        assert_eq!(parsed.user_id, "default_user");
     }
 
     #[test]
@@ -5758,13 +5661,12 @@ enable = true
         let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.enabled);
         assert!(parsed.api_key.is_none());
-        assert_eq!(parsed.entity_id, "default");
+        assert_eq!(parsed.user_id, "default_user");
     }
 
     // ══════════════════════════════════════════════════════════
     // SECRETS CONFIG TESTS
     // ══════════════════════════════════════════════════════════
-
     #[test]
     async fn secrets_config_default_encrypts() {
         let s = SecretsConfig::default();

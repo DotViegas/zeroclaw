@@ -230,6 +230,92 @@ impl Agent {
         self.history.clear();
     }
 
+    /// Reload Composio tools without restarting the agent
+    ///
+    /// This method refreshes the Composio tools in the agent's tool registry,
+    /// invalidating caches and fetching fresh tool lists from the MCP server
+    /// or REST API. This enables hot reload of tools without requiring agent restart.
+    ///
+    /// # Arguments
+    /// * `config` - Composio configuration
+    /// * `security` - Security policy for tool execution
+    /// * `provider` - Optional LLM provider for natural language tool
+    /// * `model` - Optional model name for natural language tool
+    ///
+    /// # Returns
+    /// `Ok(usize)` with the number of tools reloaded, or `Err` on failure
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use zeroclaw::agent::Agent;
+    /// # use zeroclaw::config::Config;
+    /// # use zeroclaw::security::SecurityPolicy;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let config = Config::load()?;
+    /// let mut agent = Agent::from_config(&config).await?;
+    /// let security = Arc::new(SecurityPolicy::default());
+    ///
+    /// // Reload Composio tools
+    /// let count = agent.reload_composio_tools(
+    ///     &config.composio,
+    ///     security,
+    ///     None,
+    ///     None
+    /// ).await?;
+    /// println!("Reloaded {} Composio tools", count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn reload_composio_tools(
+        &mut self,
+        config: &crate::config::ComposioConfig,
+        security: Arc<crate::security::SecurityPolicy>,
+        provider: Option<Arc<dyn crate::providers::Provider>>,
+        model: Option<String>,
+    ) -> Result<usize> {
+        tracing::info!("Reloading Composio tools in agent");
+        
+        // Refresh Composio tools
+        let refreshed_tools = tools::refresh_composio_tools(
+            config,
+            security,
+            provider,
+            model,
+        ).await;
+        
+        if refreshed_tools.is_empty() {
+            tracing::warn!("No Composio tools loaded after refresh");
+            return Ok(0);
+        }
+        
+        // Remove old Composio tools from registry
+        // Composio tools are identified by name prefix or specific names
+        self.tools.retain(|tool| {
+            let name = tool.name();
+            // Keep non-Composio tools
+            !name.starts_with("COMPOSIO_") && 
+            name != "composio" && 
+            name != "composio_nl"
+        });
+        
+        // Add refreshed tools
+        let count = refreshed_tools.len();
+        let boxed_tools = tools::boxed_registry_from_arcs(refreshed_tools);
+        self.tools.extend(boxed_tools);
+        
+        // Rebuild tool specs
+        self.tool_specs = self.tools.iter().map(|t| t.spec()).collect();
+        
+        tracing::info!(
+            tool_count = count,
+            total_tools = self.tools.len(),
+            "Composio tools reloaded successfully"
+        );
+        
+        Ok(count)
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -253,11 +339,15 @@ impl Agent {
         } else {
             None
         };
-        let composio_entity_id = if config.composio.enabled {
-            Some(config.composio.entity_id.as_str())
+        
+        // Store the user_id String so we can reference it
+        let composio_user_id_owned = if config.composio.enabled {
+            let (user_id, _is_legacy) = config.composio.effective_user_id();
+            Some(user_id)
         } else {
             None
         };
+        let composio_entity_id = composio_user_id_owned.as_deref();
 
         let tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),

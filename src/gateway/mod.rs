@@ -361,10 +361,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
     ));
 
+    let composio_user_id_owned = if config.composio.enabled {
+        let (user_id, _is_legacy) = config.composio.effective_user_id();
+        Some(user_id)
+    } else {
+        None
+    };
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
+            composio_user_id_owned.as_deref(),
         )
     } else {
         (None, None)

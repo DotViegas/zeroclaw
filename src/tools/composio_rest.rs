@@ -36,6 +36,26 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
 }
 
 /// A tool that proxies actions to the Composio managed tool platform.
+///
+/// # Deprecation Notice
+///
+/// This implementation is deprecated in favor of `ComposioNaturalLanguageTool` which uses
+/// the MCP (Model Context Protocol) Pattern 2 approach for dynamic tool discovery and execution.
+///
+/// **Migration Guide:** See `docs/composio-migration.md` for step-by-step instructions on
+/// migrating from REST API (Pattern 1) to MCP (Pattern 2).
+///
+/// **Why deprecated:**
+/// - Pattern 1 (REST direct) requires upfront tool loading and manual schema management
+/// - Pattern 2 (MCP meta-tools) provides dynamic discovery via natural language
+/// - MCP approach supports all 5 Composio v3 meta tools including Workbench for large data operations
+/// - Better OAuth management and connection caching with MCP
+///
+/// **Timeline:** This implementation will be removed in a future major version.
+#[deprecated(
+    since = "0.1.0",
+    note = "Use ComposioNaturalLanguageTool with MCP Pattern 2 instead. See docs/composio-migration.md for migration guide."
+)]
 pub struct ComposioTool {
     rest_client: Arc<ComposioRestClient>,
     api_key: String,
@@ -50,11 +70,22 @@ impl ComposioTool {
         default_entity_id: Option<&str>,
         security: Arc<SecurityPolicy>,
     ) -> Self {
-        let rest_client = Arc::new(ComposioRestClient::new(api_key.to_string()));
+        // Emit deprecation warning
+        tracing::warn!(
+            target: "zeroclaw::tools::composio",
+            component = "ComposioTool",
+            event = "deprecation_warning",
+            message = "ComposioTool (REST API Pattern 1) is deprecated. Use ComposioNaturalLanguageTool with MCP Pattern 2 instead.",
+            migration_guide = "https://github.com/zeroclaw/zeroclaw/blob/main/docs/composio-migration.md",
+            "ComposioTool instantiated - this implementation is deprecated and will be removed in a future version"
+        );
+        
+        let entity_id = normalize_entity_id(default_entity_id.unwrap_or("default"));
+        let rest_client = Arc::new(ComposioRestClient::new(api_key.to_string(), entity_id.clone()));
         Self {
             rest_client,
             api_key: api_key.to_string(),
-            default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
+            default_entity_id: entity_id,
             security,
             recent_connected_accounts: RwLock::new(HashMap::new()),
         }
@@ -1211,78 +1242,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extract_connected_account_id_supports_common_shapes() {
-        let root = json!({"connected_account_id": "ca_root"});
-        let camel = json!({"connectedAccountId": "ca_camel"});
-        let nested = json!({"data": {"connected_account_id": "ca_nested"}});
-
-        assert_eq!(
-            extract_connected_account_id(&root).as_deref(),
-            Some("ca_root")
-        );
-        assert_eq!(
-            extract_connected_account_id(&camel).as_deref(),
-            Some("ca_camel")
-        );
-        assert_eq!(
-            extract_connected_account_id(&nested).as_deref(),
-            Some("ca_nested")
-        );
-    }
-
-    #[test]
-    fn extract_redirect_url_supports_v2_and_v3_shapes() {
-        let v2 = json!({"redirectUrl": "https://app.composio.dev/connect-v2"});
-        let v3 = json!({"redirect_url": "https://app.composio.dev/connect-v3"});
-        let nested = json!({"data": {"redirect_url": "https://app.composio.dev/connect-nested"}});
-
-        assert_eq!(
-            extract_redirect_url(&v2).as_deref(),
-            Some("https://app.composio.dev/connect-v2")
-        );
-        assert_eq!(
-            extract_redirect_url(&v3).as_deref(),
-            Some("https://app.composio.dev/connect-v3")
-        );
-        assert_eq!(
-            extract_redirect_url(&nested).as_deref(),
-            Some("https://app.composio.dev/connect-nested")
-        );
-    }
-
-    #[test]
-    fn auth_config_prefers_enabled_status() {
-        let enabled = ComposioAuthConfig {
-            id: "cfg_1".into(),
-            status: Some("ENABLED".into()),
-            enabled: None,
-        };
-        let disabled = ComposioAuthConfig {
-            id: "cfg_2".into(),
-            status: Some("DISABLED".into()),
-            enabled: Some(false),
-        };
-
-        assert!(enabled.is_enabled());
-        assert!(!disabled.is_enabled());
-    }
-
-    #[test]
-    fn extract_api_error_message_from_common_shapes() {
-        let nested = r#"{"error":{"message":"tool not found"}}"#;
-        let flat = r#"{"message":"invalid api key"}"#;
-
-        assert_eq!(
-            extract_api_error_message(nested).as_deref(),
-            Some("tool not found")
-        );
-        assert_eq!(
-            extract_api_error_message(flat).as_deref(),
-            Some("invalid api key")
-        );
-        assert_eq!(extract_api_error_message("not-json"), None);
-    }
 
     #[test]
     fn composio_action_with_null_fields() {

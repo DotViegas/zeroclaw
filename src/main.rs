@@ -1380,9 +1380,8 @@ async fn handle_composio_command(command: ComposioCommands, config: &Config) -> 
             use zeroclaw::mcp::ComposioMcpClient;
             use std::sync::Arc;
 
-            let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
-            
             let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
+            let rest_client = Arc::new(ComposioRestClient::new(api_key.clone(), user_id.clone()));
             
             let mcp_client = if let Some(mcp_url) = &config.composio.mcp.mcp_url {
                 Arc::new(ComposioMcpClient::new_with_mcp_url(
@@ -1520,7 +1519,7 @@ async fn handle_composio_connect(
     println!("🔗 Connecting {} for user '{}'...\n", toolkit_slug, user_id);
     
     // Create REST client
-    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone(), user_id.clone()));
     
     // Check if already connected
     match rest_client.list_connected_accounts(Some(&toolkit_slug), Some(&user_id)).await {
@@ -1611,7 +1610,7 @@ async fn handle_composio_list_toolkits(
     let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
     
     // Create REST client
-    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone(), user_id.clone()));
     
     // Get configured toolkits
     let configured_toolkits = &config.composio.mcp.toolkits;
@@ -1696,7 +1695,7 @@ async fn handle_composio_list_connections(
     let user_id = config.composio.mcp.user_id.clone().unwrap_or_else(|| "default".to_string());
     
     // Create REST client
-    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone(), user_id.clone()));
     
     // List connections
     let accounts = rest_client.list_connected_accounts(toolkit_filter, Some(&user_id)).await?;
@@ -1774,7 +1773,7 @@ async fn handle_composio_disconnect(
     println!("🔌 Disconnecting {} for user '{}'...\n", toolkit_slug, user_id);
     
     // Create REST client
-    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone(), user_id.clone()));
     
     // Check if connected
     let accounts = rest_client.list_connected_accounts(Some(&toolkit_slug), Some(&user_id)).await?;
@@ -2117,7 +2116,7 @@ async fn handle_composio_status(config: &Config, verbose: bool) -> Result<()> {
     }
     
     // Create clients for health check
-    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone()));
+    let rest_client = Arc::new(ComposioRestClient::new(api_key.clone(), user_id.clone()));
     
     let mcp_client = if let Some(mcp_url) = &config.composio.mcp.mcp_url {
         Arc::new(ComposioMcpClient::new_with_mcp_url(

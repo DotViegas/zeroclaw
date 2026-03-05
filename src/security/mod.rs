@@ -21,6 +21,7 @@
 pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod composio_policy;
 pub mod detect;
 pub mod docker;
 pub mod domain_matcher;
@@ -37,6 +38,8 @@ pub mod traits;
 
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
+#[allow(unused_imports)]
+pub use composio_policy::{ComposioSecurityConfig, ComposioSecurityError, ComposioSecurityPolicy};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use domain_matcher::DomainMatcher;

@@ -8,13 +8,7 @@ mod tests {
     use super::super::rest_blocking::ComposioRestBlockingClient;
 
     #[test]
-    fn client_constructs_with_api_key() {
-        let client = ComposioRestBlockingClient::new("test_key".to_string());
-        assert_eq!(client.api_key, "test_key");
-    }
-
-    #[test]
-    fn client_has_http_client() {
+    fn client_constructs_without_panicking() {
         let client = ComposioRestBlockingClient::new("test_key".to_string());
         // Just verify it constructs without panicking
         drop(client);

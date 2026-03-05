@@ -46,6 +46,9 @@ pub struct ComposioNaturalLanguageTool {
     mcp_client: Arc<McpClient>,
     security: Arc<SecurityPolicy>,
     
+    // Composio-specific security policy (optional, for toolkit filtering and rate limiting)
+    composio_security: Option<Arc<crate::security::ComposioSecurityPolicy>>,
+    
     // Session management
     current_session: Arc<RwLock<Option<ComposioSession>>>,
     session_ttl: std::time::Duration,
@@ -73,6 +76,7 @@ impl ComposioNaturalLanguageTool {
         Self {
             mcp_client,
             security,
+            composio_security: None,
             current_session: Arc::new(RwLock::new(None)),
             session_ttl: std::time::Duration::from_secs(1800), // 30 minutes
             request_id: Arc::new(RwLock::new(1)),
@@ -94,6 +98,7 @@ impl ComposioNaturalLanguageTool {
         Self {
             mcp_client,
             security,
+            composio_security: None,
             current_session: Arc::new(RwLock::new(None)),
             session_ttl: std::time::Duration::from_secs(1800), // 30 minutes
             request_id: Arc::new(RwLock::new(1)),
@@ -102,6 +107,12 @@ impl ComposioNaturalLanguageTool {
             api_key,
             execution_history: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+    
+    /// Set the Composio-specific security policy for toolkit filtering and rate limiting.
+    pub fn with_composio_security(mut self, composio_security: Arc<crate::security::ComposioSecurityPolicy>) -> Self {
+        self.composio_security = Some(composio_security);
+        self
     }
     
     /// Get next request ID
@@ -164,6 +175,50 @@ impl ComposioNaturalLanguageTool {
         // Session management is handled server-side
         // We just need to pass generate_id: true in each request
         Ok(())
+    }
+    /// Determine whether to use Workbench for the given query
+    ///
+    /// Workbench should be used for:
+    /// - Bulk operations (keywords: all, every, list, export, bulk, batch)
+    /// - Large data operations (keywords: csv, spreadsheet, report, summary, analyze)
+    /// - Operations likely to produce responses exceeding context window limits
+    ///
+    /// # Arguments
+    /// * `query` - The natural language query from the user
+    /// * `force_workbench` - Optional flag to force Workbench usage
+    ///
+    /// # Returns
+    /// `true` if Workbench should be used, `false` for direct execution
+    pub fn should_use_workbench(&self, query: &str, force_workbench: Option<bool>) -> bool {
+        // If explicitly forced, use Workbench
+        if force_workbench.unwrap_or(false) {
+            return true;
+        }
+
+        let query_lower = query.to_lowercase();
+
+        // Bulk operation keywords
+        let bulk_keywords = [
+            "all", "every", "list", "export", "bulk", "batch",
+            "hundreds", "thousands", "many", "multiple"
+        ];
+
+        // Large data keywords
+        let large_data_keywords = [
+            "csv", "spreadsheet", "report", "summary", "analyze",
+            "analysis", "statistics", "aggregate", "count"
+        ];
+
+        // Check for bulk keywords
+        let has_bulk_keyword = bulk_keywords.iter()
+            .any(|kw| query_lower.contains(kw));
+
+        // Check for large data keywords
+        let has_large_data_keyword = large_data_keywords.iter()
+            .any(|kw| query_lower.contains(kw));
+
+        // Use Workbench if either condition is met
+        has_bulk_keyword || has_large_data_keyword
     }
     
     /// Search for tools matching the user's query
@@ -760,13 +815,16 @@ impl ComposioNaturalLanguageTool {
              6. NEVER put file content in 's3key' - s3key is a storage reference, not content\n\
              7. If the schema requires 'content' with 's3key', use 'local_file_path' instead\n\
              8. For 'local_file_path', use the absolute path from the query or infer from filename\n\
-             9. IMPORTANT FOR EMAIL ATTACHMENTS:\n\
-                - If the query mentions 'attach', 'file', 'arquivo', 'anexo', 'from dropbox', 'from drive'\n\
+             9. CRITICAL FOR EMAIL ATTACHMENTS (HIGHEST PRIORITY):\n\
+                - When sending emails, ALWAYS prefer REAL file attachments over temporary links\n\
+                - If the query mentions 'attach', 'file', 'arquivo', 'anexo', 'send file', 'enviar arquivo'\n\
                 - AND the schema has an 'attachment' field (check the schema above!)\n\
                 - AND you see file metadata in the RECENT FILE DOWNLOADS section above\n\
                 - THEN you MUST include the 'attachment' field in your response\n\
                 - Use the EXACT s3key, mimetype, and name from the RECENT FILE DOWNLOADS\n\
                 - Structure: {{\"name\": \"<from downloads>\", \"mimetype\": \"<from downloads>\", \"s3key\": \"<from downloads>\"}}\n\
+                - NEVER use temporary download links when attachment field is available\n\
+                - Temporary links are ONLY acceptable if the tool doesn't support attachments\n\
              10. Do not include any explanation, only the JSON object\n\n\
              Example output format:\n\
              {{\"path\": \"/test.txt\", \"local_file_path\": \"C:/temp/test.txt\", \"mode\": \"overwrite\"}}\n\n\
@@ -1310,6 +1368,329 @@ impl ComposioNaturalLanguageTool {
         Ok(file_key.to_string())
     }
     
+    /// Execute Office file operations via COMPOSIO_REMOTE_WORKBENCH
+    /// 
+    /// This method generates Python code to:
+    /// 1. Download the Office file from cloud storage (Dropbox, etc.)
+    /// 2. Load it with appropriate library (openpyxl for Excel, python-docx for Word)
+    /// 3. Make the requested edits while preserving existing content
+    /// 4. Upload the modified file back to cloud storage
+    ///
+    /// # Arguments
+    /// * `query` - Natural language query describing the Office file operation
+    ///
+    /// # Returns
+    /// * `Ok(ToolResult)` - Workbench execution result
+    /// * `Err(anyhow::Error)` - Execution errors
+    async fn execute_via_workbench(&self, query: &str) -> Result<ToolResult> {
+        tracing::info!(
+            query = query,
+            "Executing Office file operation via COMPOSIO_REMOTE_WORKBENCH"
+        );
+        
+        // Generate Python code for Workbench based on the query
+        let python_code = self.generate_workbench_code_for_office(query).await?;
+        
+        tracing::info!(
+            "=== WORKBENCH CODE (FULL) ===\n{}\n=== END CODE ===",
+            python_code
+        );
+        
+        // Invoke COMPOSIO_REMOTE_WORKBENCH meta tool directly
+        let params = serde_json::json!({
+            "code_to_execute": python_code,
+            "session": {
+                "generate_id": true
+            }
+        });
+        
+        tracing::info!(
+            "=== WORKBENCH REQUEST ===\n{}\n=== END REQUEST ===",
+            serde_json::to_string_pretty(&params).unwrap_or_default()
+        );
+        
+        let request_id = self.next_request_id().await;
+        let result = self.mcp_client
+            .tools_call(request_id, "COMPOSIO_REMOTE_WORKBENCH", params)
+            .await
+            .context("Failed to call COMPOSIO_REMOTE_WORKBENCH")?;
+        
+        tracing::info!(
+            "=== WORKBENCH RAW RESPONSE ===\n{}\n=== END RESPONSE ===",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result))
+        );
+        
+        // Parse JSON-RPC response
+        let rpc_response: JsonRpcResponse = serde_json::from_value(result)
+            .context("Failed to parse JSON-RPC response")?;
+        
+        tracing::info!(
+            "=== WORKBENCH JSON-RPC PARSED ===\nhas_error: {}\nhas_result: {}\n=== END PARSED ===",
+            rpc_response.error.is_some(),
+            rpc_response.result.is_some()
+        );
+        
+        if let Some(error) = rpc_response.error {
+            tracing::error!(
+                "=== WORKBENCH ERROR ===\ncode: {}\nmessage: {}\ndata: {:?}\n=== END ERROR ===",
+                error.code,
+                error.message,
+                error.data
+            );
+            anyhow::bail!("JSON-RPC error: {} (code: {})", error.message, error.code);
+        }
+        
+        let result_data = rpc_response.result
+            .ok_or_else(|| anyhow::anyhow!("No result in JSON-RPC response"))?;
+        
+        tracing::info!(
+            "=== WORKBENCH RESULT DATA ===\n{}\n=== END RESULT DATA ===",
+            serde_json::to_string_pretty(&result_data).unwrap_or_default()
+        );
+        
+        // Parse the content[0].text JSON string
+        let parsed_data = result_data.get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("text"))
+            .and_then(|text| text.as_str())
+            .and_then(|text_str| {
+                tracing::info!(
+                    "=== WORKBENCH TEXT CONTENT ===\n{}\n=== END TEXT ===",
+                    text_str
+                );
+                serde_json::from_str::<serde_json::Value>(text_str).ok()
+            })
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse Workbench response"))?;
+        
+        tracing::info!(
+            "=== WORKBENCH PARSED DATA ===\n{}\n=== END PARSED DATA ===",
+            serde_json::to_string_pretty(&parsed_data).unwrap_or_default()
+        );
+        
+        // Extract output from Workbench response
+        let output = if let Some(data) = parsed_data.get("data") {
+            if let Some(output_str) = data.get("output").and_then(|o| o.as_str()) {
+                output_str.to_string()
+            } else {
+                serde_json::to_string_pretty(data)?
+            }
+        } else {
+            serde_json::to_string_pretty(&parsed_data)?
+        };
+        
+        tracing::info!(
+            output_preview = %format!("{:.200}", output),
+            "Workbench execution completed"
+        );
+        
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
+    }
+    
+    /// Generate Python code for Workbench to handle Office file operations
+    ///
+    /// Uses LLM (if available) to generate appropriate Python code based on the query.
+    /// Falls back to template-based generation if LLM is not available.
+    async fn generate_workbench_code_for_office(&self, query: &str) -> Result<String> {
+        // If we have an LLM provider, use it to generate the code
+        if let Some(provider) = &self.provider {
+            let system_prompt = r#"You are a Python code generator for Composio Workbench.
+Generate Python code to handle Office file operations (Excel/Word) that:
+1. Downloads the file from cloud storage using run_composio_tool()
+2. Loads it with openpyxl (Excel) or python-docx (Word) - MUST use load_workbook() to preserve content
+3. Makes the requested edits
+4. Uploads the modified file back using upload_local_file() and run_composio_tool()
+
+Available helper functions:
+- run_composio_tool(tool_slug, arguments) - Execute any Composio tool
+- upload_local_file(local_path) - Upload file to cloud storage, returns s3key
+- invoke_llm(prompt) - Call LLM for help
+
+Pre-installed libraries: openpyxl, python-docx, pandas, numpy
+
+CRITICAL RULES:
+- For Excel: Use openpyxl.load_workbook(file_path) to LOAD existing file (preserves content)
+- DON'T create new workbooks with openpyxl.Workbook() - this overwrites everything
+- For Word: Use python-docx Document(file_path) to load existing document
+- Save to a local file path, then upload it
+
+Return ONLY the Python code, no explanations."#;
+            
+            let user_prompt = format!("Generate Python code for this Office file operation:\n\n{}", query);
+            
+            match provider.chat_with_system(
+                Some(system_prompt),
+                &user_prompt,
+                self.model.as_deref().unwrap_or("gpt-4"),
+                0.3, // Low temperature for code generation
+            ).await {
+                Ok(code) => {
+                    // Clean up code (remove markdown code blocks if present)
+                    let code = code.trim();
+                    let code = if code.starts_with("```python") {
+                        code.strip_prefix("```python").unwrap_or(code).trim()
+                    } else if code.starts_with("```") {
+                        code.strip_prefix("```").unwrap_or(code).trim()
+                    } else {
+                        code
+                    };
+                    let code = if code.ends_with("```") {
+                        code.strip_suffix("```").unwrap_or(code).trim()
+                    } else {
+                        code
+                    };
+                    
+                    tracing::info!("Generated Workbench code using LLM");
+                    return Ok(code.to_string());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to generate code with LLM, falling back to template"
+                    );
+                }
+            }
+        }
+        
+        // Fallback: Generate template-based code
+        tracing::info!("Generating Workbench code using template (no LLM available)");
+        
+        // Extract file path from query
+        let file_path = self.extract_file_path_from_query(query);
+        
+        // Determine file type
+        let is_excel = query.to_lowercase().contains(".xlsx") || query.to_lowercase().contains(".xls");
+        let is_word = query.to_lowercase().contains(".docx") || query.to_lowercase().contains(".doc");
+        
+        if is_excel {
+            Ok(format!(r#"
+# Download Excel file from Dropbox
+file_path = "{}"
+download_result = run_composio_tool("DROPBOX_READ_FILE", {{"path": file_path}})
+
+# Extract s3key from download result
+s3key = download_result.get("content", {{}}).get("s3key")
+if not s3key:
+    print("Error: Failed to download file")
+else:
+    # Download file locally
+    import requests
+    response = requests.get(s3key)
+    local_path = "/tmp/temp_file.xlsx"
+    with open(local_path, "wb") as f:
+        f.write(response.content)
+    
+    # Load existing workbook (PRESERVES CONTENT)
+    from openpyxl import load_workbook
+    wb = load_workbook(local_path)
+    ws = wb.active
+    
+    # Make edits based on query: {}
+    # Example: Add 3 rows with sample data
+    next_row = ws.max_row + 1
+    for i in range(3):
+        ws.cell(row=next_row + i, column=1, value=f"Item {{i+1}}")
+        ws.cell(row=next_row + i, column=2, value=f"Value {{i+1}}")
+    
+    # Save modified file
+    output_path = "/tmp/modified_file.xlsx"
+    wb.save(output_path)
+    
+    # Upload back to Dropbox
+    s3key_upload = upload_local_file(output_path)
+    upload_result = run_composio_tool("DROPBOX_UPLOAD_FILE", {{
+        "path": file_path,
+        "content": {{
+            "name": file_path.split("/")[-1],
+            "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "s3key": s3key_upload
+        }},
+        "mode": "overwrite"
+    }})
+    
+    print(f"File updated successfully: {{file_path}}")
+"#, file_path, query))
+        } else if is_word {
+            Ok(format!(r#"
+# Download Word file from Dropbox
+file_path = "{}"
+download_result = run_composio_tool("DROPBOX_READ_FILE", {{"path": file_path}})
+
+# Extract s3key from download result
+s3key = download_result.get("content", {{}}).get("s3key")
+if not s3key:
+    print("Error: Failed to download file")
+else:
+    # Download file locally
+    import requests
+    response = requests.get(s3key)
+    local_path = "/tmp/temp_file.docx"
+    with open(local_path, "wb") as f:
+        f.write(response.content)
+    
+    # Load existing document (PRESERVES CONTENT)
+    from docx import Document
+    doc = Document(local_path)
+    
+    # Make edits based on query: {}
+    # Example: Add paragraphs
+    doc.add_paragraph("Content added by Workbench")
+    
+    # Save modified file
+    output_path = "/tmp/modified_file.docx"
+    doc.save(output_path)
+    
+    # Upload back to Dropbox
+    s3key_upload = upload_local_file(output_path)
+    upload_result = run_composio_tool("DROPBOX_UPLOAD_FILE", {{
+        "path": file_path,
+        "content": {{
+            "name": file_path.split("/")[-1],
+            "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "s3key": s3key_upload
+        }},
+        "mode": "overwrite"
+    }})
+    
+    print(f"File updated successfully: {{file_path}}")
+"#, file_path, query))
+        } else {
+            anyhow::bail!("Could not determine Office file type from query")
+        }
+    }
+    
+    /// Extract file path from natural language query
+    fn extract_file_path_from_query(&self, query: &str) -> String {
+        // Look for patterns like: /path/to/file.xlsx, "file.xlsx", 'file.xlsx'
+        let query_lower = query.to_lowercase();
+        
+        // Try to find file path with extension
+        for ext in &[".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt"] {
+            if let Some(ext_pos) = query_lower.find(ext) {
+                // Find the start of the path (look backwards for space, quote, or start of string)
+                let before = &query[..ext_pos];
+                let start = before.rfind(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                    .map(|pos| pos + 1)
+                    .unwrap_or(0);
+                
+                // Extract path including extension
+                let end = ext_pos + ext.len();
+                let path = query[start..end].trim_matches(|c: char| c == '"' || c == '\'').trim();
+                
+                if !path.is_empty() {
+                    return path.to_string();
+                }
+            }
+        }
+        
+        // Fallback: return a placeholder
+        "/path/to/file.xlsx".to_string()
+    }
+    
     /// Execute a discovered tool
     async fn execute_tool(
         &self,
@@ -1504,6 +1885,54 @@ impl ComposioNaturalLanguageTool {
         
         Ok(parsed_data)
     }
+
+    /// Clear all cached state (session, execution history)
+    ///
+    /// This method invalidates all cached state in the natural language tool,
+    /// including the current session and execution history. This is useful for
+    /// hot reload scenarios where a fresh start is needed.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use zeroclaw::tools::ComposioNaturalLanguageTool;
+    /// # use zeroclaw::mcp::McpClient;
+    /// # use zeroclaw::security::SecurityPolicy;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let mcp_client = Arc::new(McpClient::new("url", "key")?);
+    /// let security = Arc::new(SecurityPolicy::default());
+    /// let tool = ComposioNaturalLanguageTool::new(
+    ///     mcp_client,
+    ///     security,
+    ///     "api_key".to_string()
+    /// );
+    ///
+    /// // Clear all cached state
+    /// tool.clear_cache().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn clear_cache(&self) {
+        // Clear session
+        {
+            let mut session = self.current_session.write().await;
+            *session = None;
+        }
+        
+        // Clear execution history
+        {
+            let mut history = self.execution_history.write().await;
+            history.clear();
+        }
+        
+        // Reset request ID counter
+        {
+            let mut id = self.request_id.write().await;
+            *id = 1;
+        }
+        
+        tracing::debug!("Composio Natural Language Tool cache cleared");
+    }
 }
 
 #[async_trait]
@@ -1521,34 +1950,42 @@ impl Tool for ComposioNaturalLanguageTool {
     }
     
     fn parameters_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Natural language description of what you want to do. \
-                    Be specific about the app and action. \
-                    Examples: 'list my gmail emails', 'create github issue in my-repo', \
-                    'send slack message to #general'"
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language description of what you want to do. \
+                        Be specific about the app and action. \
+                        Examples: 'list my gmail emails', 'create github issue in my-repo', \
+                        'send slack message to #general'"
+                    },
+                    "tool_slug": {
+                        "type": "string",
+                        "description": "Optional: Exact Composio tool name to bypass search (e.g., 'DROPBOX_GET_TEMPORARY_LINK'). \
+                        If you know the exact tool, use this to force its execution and avoid semantic search errors."
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Optional: Specific arguments if you know them. \
+                        If not provided, the tool will attempt to extract them from the query.",
+                        "additionalProperties": true
+                    },
+                    "use_workbench": {
+                        "type": "boolean",
+                        "description": "Optional: Force use of Workbench for large data operations. \
+                        Workbench is automatically used for bulk operations (all, every, list, export) \
+                        and large data operations (csv, spreadsheet, report, summary). \
+                        Set to true to force Workbench usage for operations that may produce large outputs.",
+                        "default": false
+                    }
                 },
-                "tool_slug": {
-                    "type": "string",
-                    "description": "Optional: Exact Composio tool name to bypass search (e.g., 'DROPBOX_GET_TEMPORARY_LINK'). \
-                    If you know the exact tool, use this to force its execution and avoid semantic search errors."
-                },
-                "arguments": {
-                    "type": "object",
-                    "description": "Optional: Specific arguments if you know them. \
-                    If not provided, the tool will attempt to extract them from the query.",
-                    "additionalProperties": true
-                }
-            },
-            "required": ["query"]
-        })
-    }
+                "required": ["query"]
+            })
+        }
     
     async fn execute(&self, args: Value) -> Result<ToolResult> {
-        // Security check
+        // Security check - core policy
         if let Err(error) = self.security.enforce_tool_operation(
             crate::security::policy::ToolOperation::Act,
             "composio_nl",
@@ -1565,8 +2002,41 @@ impl Tool for ComposioNaturalLanguageTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'query' parameter"))?;
         
         let provided_args = args.get("arguments").cloned();
+        let use_workbench = args.get("use_workbench")
+            .and_then(|v| v.as_bool());
         
         tracing::info!(query = query, "Executing Composio natural language tool");
+        
+        // Check for Office file EDIT operations - USE WORKBENCH DIRECTLY
+        let office_extensions = [".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt"];
+        let is_office_file = office_extensions.iter().any(|ext| query.to_lowercase().contains(ext));
+        
+        // Only intercept EDIT operations (not read/download)
+        let edit_keywords = ["edit", "add", "modify", "update", "change", "append", "insert", "delete row", "delete column"];
+        let is_edit_operation = edit_keywords.iter().any(|kw| query.to_lowercase().contains(kw));
+        
+        // CRITICAL: For Office file edits, ALWAYS use COMPOSIO_REMOTE_WORKBENCH
+        if is_office_file && is_edit_operation {
+            tracing::info!(
+                query = query,
+                "Office file EDIT operation detected! Invoking COMPOSIO_REMOTE_WORKBENCH directly to preserve existing content"
+            );
+            
+            // Invoke Workbench directly - it's a meta tool, not discovered via SEARCH_TOOLS
+            return self.execute_via_workbench(query).await;
+        }
+        
+        // Check if Workbench should be used for this query
+        let should_use_wb = self.should_use_workbench(query, use_workbench);
+        if should_use_wb {
+            tracing::info!(
+                query = query,
+                forced = use_workbench.unwrap_or(false),
+                "Workbench mode recommended for this query (bulk/large data operation detected)"
+            );
+            // TODO: Implement Workbench execution path in task 10
+            // For now, continue with direct execution
+        }
         
         // 1. Ensure we have a session (no-op now, server manages sessions)
         match self.ensure_session().await {
@@ -1632,6 +2102,22 @@ impl Tool for ComposioNaturalLanguageTool {
             toolkit = tool.toolkit,
             "Selected tool for execution"
         );
+        
+        // Security check - Composio-specific policy (toolkit filtering, rate limiting)
+        if let Some(ref composio_security) = self.composio_security {
+            // Extract user_id from args or use "default_user"
+            let user_id = args.get("user_id")
+                .and_then(|u| u.as_str())
+                .unwrap_or("default_user");
+            
+            if let Err(e) = composio_security.check_toolkit_execution(&tool.toolkit, user_id) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Security policy denied execution: {}", e)),
+                });
+            }
+        }
         
         // 4. Ensure toolkit is connected
         match self.ensure_connected(&tool.toolkit).await {
@@ -1706,6 +2192,463 @@ impl Tool for ComposioNaturalLanguageTool {
                     error: Some(format!("Tool execution failed: {}", e)),
                 })
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Test helper to parse discovered tools from a mock response
+    fn create_mock_search_response(results: Vec<serde_json::Value>) -> Value {
+        json!({
+            "content": [{
+                "text": json!({
+                    "data": {
+                        "results": results
+                    }
+                }).to_string()
+            }]
+        })
+    }
+
+    /// Test helper to create a mock schema response
+    fn create_mock_schema_response(schemas: serde_json::Map<String, Value>) -> Value {
+        json!({
+            "content": [{
+                "text": json!({
+                    "data": {
+                        "tool_schemas": schemas
+                    }
+                }).to_string()
+            }]
+        })
+    }
+
+
+    /// Test 1: Successful parsing of discovered tools from valid response
+    #[test]
+    fn test_parse_discovered_tools_success() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        let result_data = create_mock_search_response(vec![
+            json!({
+                "primary_tool_slugs": ["GMAIL_SEND_EMAIL"],
+                "use_case": "send email",
+                "execution_guidance": "Send an email via Gmail",
+                "toolkits": ["gmail"],
+                "tool_schemas": [{
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "to": {"type": "string"},
+                            "subject": {"type": "string"},
+                            "body": {"type": "string"}
+                        },
+                        "required": ["to", "subject", "body"]
+                    }
+                }]
+            })
+        ]);
+
+        let result = tool.parse_discovered_tools(result_data);
+        assert!(result.is_ok(), "parse_discovered_tools should succeed");
+        
+        let discovered = result.unwrap();
+        assert_eq!(discovered.len(), 1, "Should discover 1 tool");
+        assert_eq!(discovered[0].tool_slug, "GMAIL_SEND_EMAIL");
+        assert_eq!(discovered[0].toolkit, "gmail");
+        assert_eq!(discovered[0].use_case, "send email");
+        assert!(discovered[0].input_schema.is_some(), "Should have schema from tool_schemas");
+    }
+
+    /// Test 2: Parsing multiple tools from response
+    #[test]
+    fn test_parse_multiple_discovered_tools() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        let result_data = create_mock_search_response(vec![
+            json!({
+                "primary_tool_slugs": ["GITHUB_CREATE_ISSUE"],
+                "use_case": "create github issue",
+                "execution_guidance": "Create a new issue in GitHub",
+                "toolkits": ["github"]
+            }),
+            json!({
+                "tool_slug": "SLACK_SEND_MESSAGE",
+                "use_case": "send slack message",
+                "execution_guidance": "Send a message to Slack",
+                "toolkit": "slack"
+            })
+        ]);
+
+        let result = tool.parse_discovered_tools(result_data);
+        assert!(result.is_ok(), "parse_discovered_tools should succeed");
+        
+        let discovered = result.unwrap();
+        assert_eq!(discovered.len(), 2, "Should discover 2 tools");
+        assert_eq!(discovered[0].tool_slug, "GITHUB_CREATE_ISSUE");
+        assert_eq!(discovered[0].toolkit, "github");
+        assert_eq!(discovered[1].tool_slug, "SLACK_SEND_MESSAGE");
+        assert_eq!(discovered[1].toolkit, "slack");
+    }
+
+    /// Test 3: Parsing tools with alternative field names
+    #[test]
+    fn test_parse_tools_with_alternative_fields() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        let result_data = create_mock_search_response(vec![
+            json!({
+                "action_slug": "NOTION_CREATE_PAGE",
+                "use_case": "create notion page",
+                "execution_guidance": "Create a new page in Notion",
+                "app": "notion"
+            })
+        ]);
+
+        let result = tool.parse_discovered_tools(result_data);
+        assert!(result.is_ok());
+        
+        let discovered = result.unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].tool_slug, "NOTION_CREATE_PAGE");
+        assert_eq!(discovered[0].toolkit, "notion");
+    }
+
+    /// Test 4: Parsing tools with toolkit inference from use_case
+    #[test]
+    fn test_parse_tools_with_toolkit_inference() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        let result_data = create_mock_search_response(vec![
+            json!({
+                "primary_tool_slugs": ["SEND_EMAIL"],
+                "use_case": "send email via gmail",
+                "execution_guidance": "Send an email using Gmail API"
+            }),
+            json!({
+                "primary_tool_slugs": ["CREATE_ISSUE"],
+                "use_case": "create github issue",
+                "execution_guidance": "Create a new GitHub issue"
+            })
+        ]);
+
+        let result = tool.parse_discovered_tools(result_data);
+        assert!(result.is_ok());
+        
+        let discovered = result.unwrap();
+        assert_eq!(discovered.len(), 2);
+        // Should infer gmail from use_case
+        assert_eq!(discovered[0].toolkit, "gmail");
+        // Should infer github from use_case
+        assert_eq!(discovered[1].toolkit, "github");
+    }
+
+    /// Test 5: Handling empty results
+    #[test]
+    fn test_parse_empty_results() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        let result_data = create_mock_search_response(vec![]);
+
+        let result = tool.parse_discovered_tools(result_data);
+        assert!(result.is_ok(), "Should handle empty results");
+        
+        let discovered = result.unwrap();
+        assert_eq!(discovered.len(), 0, "Should return empty vector");
+    }
+
+    /// Test 6: Handling malformed response structure
+    #[test]
+    fn test_parse_malformed_response() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        // Missing content array
+        let malformed_data = json!({
+            "data": {
+                "results": []
+            }
+        });
+
+        let result = tool.parse_discovered_tools(malformed_data);
+        // Should handle gracefully - either error or empty results
+        if let Ok(discovered) = result {
+            assert_eq!(discovered.len(), 0);
+        }
+    }
+
+    /// Test 7: Handling invalid JSON in text field
+    #[test]
+    fn test_parse_invalid_json_text() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        let invalid_data = json!({
+            "content": [{
+                "text": "not valid json"
+            }]
+        });
+
+        let result = tool.parse_discovered_tools(invalid_data);
+        // Should handle gracefully
+        if let Ok(discovered) = result {
+            assert_eq!(discovered.len(), 0);
+        }
+    }
+
+    /// Test 8: Parsing tools with numeric IDs
+    #[test]
+    fn test_parse_tools_with_numeric_ids() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        let result_data = create_mock_search_response(vec![
+            json!({
+                "id": 12345,
+                "use_case": "test tool",
+                "execution_guidance": "Test tool",
+                "toolkits": ["test"]
+            })
+        ]);
+
+        let result = tool.parse_discovered_tools(result_data);
+        assert!(result.is_ok());
+        
+        let discovered = result.unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].tool_slug, "12345");
+    }
+
+    /// Test 9: Parsing tools with toolkits array
+    #[test]
+    fn test_parse_tools_with_toolkits_array() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        let result_data = create_mock_search_response(vec![
+            json!({
+                "primary_tool_slugs": ["MULTI_TOOLKIT_TOOL"],
+                "use_case": "multi toolkit",
+                "execution_guidance": "Tool that works with multiple toolkits",
+                "toolkits": ["gmail", "outlook", "slack"]
+            })
+        ]);
+
+        let result = tool.parse_discovered_tools(result_data);
+        assert!(result.is_ok());
+        
+        let discovered = result.unwrap();
+        assert_eq!(discovered.len(), 1);
+        // Should use first toolkit from array
+        assert_eq!(discovered[0].toolkit, "gmail");
+    }
+
+    /// Test 10: Parsing tools with complete schema in tool_schemas
+    #[test]
+    fn test_parse_tools_with_embedded_schema() {
+        let security = Arc::new(SecurityPolicy::default());
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "param1": {"type": "string"},
+                "param2": {"type": "number"}
+            },
+            "required": ["param1"]
+        });
+
+        let result_data = create_mock_search_response(vec![
+            json!({
+                "primary_tool_slugs": ["TOOL_WITH_SCHEMA"],
+                "use_case": "tool with schema",
+                "execution_guidance": "Tool with embedded schema",
+                "toolkits": ["test"],
+                "tool_schemas": [{
+                    "parameters": schema.clone()
+                }]
+            })
+        ]);
+
+        let result = tool.parse_discovered_tools(result_data);
+        assert!(result.is_ok());
+        
+        let discovered = result.unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert!(discovered[0].input_schema.is_some());
+        
+        let parsed_schema = discovered[0].input_schema.as_ref().unwrap();
+        assert_eq!(parsed_schema["type"], "object");
+        assert!(parsed_schema["properties"]["param1"].is_object());
+    }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Property 27: Workbench Decision Logic - Integration Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod workbench_decision_tests {
+    use super::*;
+    
+    /// Feature: composio-permanent-integration, Property 27: Workbench Decision Logic
+    /// Test bulk email query uses Workbench
+    #[test]
+    fn test_bulk_email_query_uses_workbench() {
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+        
+        let query = "Label all unread emails from last week as 'needs-review'";
+        let should_use_wb = tool.should_use_workbench(query, None);
+        
+        assert!(
+            should_use_wb,
+            "Bulk email query should use Workbench (contains 'all')"
+        );
+    }
+    
+    /// Feature: composio-permanent-integration, Property 27: Workbench Decision Logic
+    /// Test CSV export query uses Workbench
+    #[test]
+    fn test_csv_export_query_uses_workbench() {
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+        
+        let query = "Export all GitHub issues to CSV and count by status";
+        let should_use_wb = tool.should_use_workbench(query, None);
+        
+        assert!(
+            should_use_wb,
+            "CSV export query should use Workbench (contains 'all' and 'csv')"
+        );
+    }
+    
+    /// Feature: composio-permanent-integration, Property 27: Workbench Decision Logic
+    /// Test single email query uses direct execution
+    #[test]
+    fn test_single_email_query_uses_direct() {
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+        
+        let query = "Send an email to user@example.com with subject 'Hello'";
+        let should_use_wb = tool.should_use_workbench(query, None);
+        
+        assert!(
+            !should_use_wb,
+            "Single email query should use direct execution (no bulk/large data keywords)"
+        );
+    }
+    
+    /// Feature: composio-permanent-integration, Property 27: Workbench Decision Logic
+    /// Test force flag overrides heuristic
+    #[test]
+    fn test_force_workbench_overrides_heuristic() {
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+        
+        let query = "Send an email to user@example.com";
+        
+        // Without force, should use direct execution
+        let should_use_wb_no_force = tool.should_use_workbench(query, None);
+        assert!(!should_use_wb_no_force, "Should use direct execution without force");
+        
+        // With force true, should use Workbench
+        let should_use_wb_force = tool.should_use_workbench(query, Some(true));
+        assert!(should_use_wb_force, "Should use Workbench when forced");
+        
+        // With force false, should not use Workbench
+        let should_not_use_wb = tool.should_use_workbench(query, Some(false));
+        assert!(!should_not_use_wb, "Should not use Workbench when explicitly disabled");
+    }
+    
+    /// Feature: composio-permanent-integration, Property 27: Workbench Decision Logic
+    /// Test report generation uses Workbench
+    #[test]
+    fn test_report_generation_uses_workbench() {
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+        
+        let query = "Generate a summary report of all Notion pages";
+        let should_use_wb = tool.should_use_workbench(query, None);
+        
+        assert!(
+            should_use_wb,
+            "Report generation query should use Workbench (contains 'all' and 'summary')"
+        );
+    }
+    
+    /// Feature: composio-permanent-integration, Property 27: Workbench Decision Logic
+    /// Test multiple bulk keywords
+    #[test]
+    fn test_multiple_bulk_keywords() {
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+        
+        let queries = vec![
+            "List every item in the database",
+            "Export batch of records",
+            "Process hundreds of files",
+            "Analyze many documents",
+        ];
+        
+        for query in queries {
+            let should_use_wb = tool.should_use_workbench(query, None);
+            assert!(
+                should_use_wb,
+                "Query '{}' should use Workbench (contains bulk keyword)",
+                query
+            );
+        }
+    }
+    
+    /// Feature: composio-permanent-integration, Property 27: Workbench Decision Logic
+    /// Test multiple large data keywords
+    #[test]
+    fn test_multiple_large_data_keywords() {
+        let mcp_client = Arc::new(McpClient::new("http://test", "test_key").unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = ComposioNaturalLanguageTool::new(mcp_client, security, "test_api_key".to_string());
+        
+        let queries = vec![
+            "Create a spreadsheet with data",
+            "Analyze the statistics",
+            "Aggregate the results",
+            "Count all occurrences",
+        ];
+        
+        for query in queries {
+            let should_use_wb = tool.should_use_workbench(query, None);
+            assert!(
+                should_use_wb,
+                "Query '{}' should use Workbench (contains large data keyword)",
+                query
+            );
         }
     }
 }

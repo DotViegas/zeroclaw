@@ -2764,25 +2764,6 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
                     .interact_text()?;
 
                 println!();
-                
-                // Get MCP-specific API key
-                println!("  {} MCP requires a separate API key from the Tool Router Session", style("ℹ").cyan());
-                print_bullet("Get it from: https://app.composio.dev/mcp (after creating session)");
-                print_bullet("It starts with 'ak_' and is different from your main Composio API key");
-                println!();
-                
-                let mcp_api_key: String = Input::new()
-                    .with_prompt("  MCP API Key (or press Enter to use main Composio key)")
-                    .allow_empty(true)
-                    .interact_text()?;
-                
-                let mcp_api_key = if mcp_api_key.trim().is_empty() {
-                    None
-                } else {
-                    Some(mcp_api_key.trim().to_string())
-                };
-
-                println!();
                 print_bullet("No toolkits selected - all tools available via meta-tool discovery");
                 print_bullet("Use composio_nl tool to access 1000+ apps with natural language");
 
@@ -2797,23 +2778,15 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
                             style("✓").green().bold()
                         );
                         
-                        if mcp_api_key.is_some() {
-                            println!(
-                                "  {} MCP: {} — using MCP-specific API key",
-                                style("✓").green().bold(),
-                                style("enabled").green()
-                            );
-                        } else {
-                            println!(
-                                "  {} MCP: {} — using main Composio API key (may cause auth issues)",
-                                style("⚠").yellow(),
-                                style("enabled").yellow()
-                            );
-                        }
+                        println!(
+                            "  {} MCP: {} — using main Composio API key",
+                            style("✓").green().bold(),
+                            style("enabled").green()
+                        );
 
                         ComposioMcpConfig {
                             enabled: true,
-                            api_key: mcp_api_key,
+                            api_key: None, // Always use main Composio API key
                             mcp_url: Some(mcp_url),
                             user_id: Some(user_id),
                             toolkits: vec![], // Empty for meta-tool discovery
@@ -2831,6 +2804,17 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
                     }
                 }
             } else {
+                println!();
+                println!(
+                    "  {} {}",
+                    style("⚠").yellow(),
+                    style("WARNING: Direct Composio tool is deprecated").yellow().bold()
+                );
+                print_bullet("The 3-step workflow (list → connect → execute) will be removed in v2.0");
+                print_bullet("Recommended: Enable MCP integration for better functionality");
+                print_bullet("MCP provides automatic tool discovery and natural language queries");
+                println!();
+                
                 println!(
                     "  {} MCP: {} — using direct Composio tool (3-step workflow)",
                     style("✓").green().bold(),
@@ -5425,7 +5409,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          The authorization link expires in 10 minutes.\n\
          ```\n\n\
          ## 🔧 MCP Configuration\n\n\
-         **Important**: Use your general Composio API key (not MCP-specific).\n\
+         **Important**: MCP uses your main Composio API key.\n\
          - Get it from: https://app.composio.dev/settings\n\
          - It starts with `ak_` and works for both direct and MCP access\n\
          - Configured in `config.toml` under `[composio]` section\n\n\
@@ -5448,18 +5432,27 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ---\n\n\
          **Remember: Use composio_nl with natural language. The tool handles discovery, auth, and execution automatically.**\n"
     } else {
-        // Direct tool: use composio with action parameter
+        // No MCP: Use deprecated Direct Tool (but warn about it)
         "\
          # COMPOSIO.md — Your Gateway to 1000+ Apps\n\n\
-         Composio gives you access to Gmail, Dropbox, Notion, GitHub, Slack, and 1000+ other apps through OAuth.\n\n\
-         ## 🚀 Two Ways to Use Composio\n\n\
-         ### Option 1: Direct Tool (Current Setup)\n\
-         Use the built-in `composio` tool with the 3-step workflow below.\n\n\
-         ### Option 2: MCP Server (Recommended for Advanced Users)\n\
-         Configure Composio as an MCP server for seamless integration.\n\
-         See \"Advanced: Setting Up Composio MCP Server\" section at the end.\n\n\
+         ## ⚠️ DEPRECATION WARNING\n\n\
+         **You are using the legacy Direct Tool pattern.**\n\n\
+         This pattern will be removed in v2.0. We **strongly recommend** enabling MCP integration:\n\n\
+         **Why upgrade to MCP?**\n\
+         - ✅ Natural language queries (no 3-step workflow)\n\
+         - ✅ Automatic tool discovery\n\
+         - ✅ Better error handling\n\
+         - ✅ Built-in Workbench for bulk operations\n\
+         - ✅ Future-proof (won't be removed)\n\n\
+         **To upgrade:**\n\
+         1. Run: `zeroclaw wizard`\n\
+         2. Choose \"Composio (managed OAuth)\"\n\
+         3. Enable MCP integration\n\
+         4. Get access to `composio_nl` tool\n\n\
          ---\n\n\
-         ## 🎯 When to Use Composio (Direct Tool)\n\n\
+         ## 🔄 Current Setup: Direct Tool (Legacy)\n\n\
+         Until you upgrade, you can still use the `composio` tool with the 3-step workflow below.\n\n\
+         ### When to Use Composio\n\n\
          **ALWAYS check Composio FIRST when the user asks to:**\n\
          - Access cloud storage (Dropbox, Google Drive, OneDrive)\n\
          - Read/send emails (Gmail, Outlook)\n\
@@ -5468,82 +5461,62 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          - Send messages (Slack, Discord, Teams)\n\
          - Access calendars, contacts, or any web service\n\n\
          **DON'T use Composio for:**\n\
-         - Local file operations (use `read`, `write`, `list_directory` instead)\n\
+         - Local file operations (use `read`, `write`, `list_directory`)\n\
          - Shell commands (use `shell` tool)\n\
          - Web scraping (use `http_request` or `browser` tools)\n\n\
-         ## 🔄 The 3-Step Workflow (MANDATORY)\n\n\
+         ## 🔄 The 3-Step Workflow\n\n\
          ### Step 1: SEARCH TOOLS (Discovery)\n\
          ```\n\
-         composio with action='list' and app='dropbox'\n\
+         composio with action='list' and app='gmail'\n\
          ```\n\
-         **What this does:**\n\
-         - Shows available actions for the app\n\
-         - Displays connection status (CONNECTED ✓ / DISCONNECTED ✗)\n\
-         - Lists tool capabilities and known pitfalls\n\n\
+         **Returns:**\n\
+         - Available actions for the app\n\
+         - Connection status (CONNECTED ✓ / DISCONNECTED ✗)\n\
+         - Tool capabilities and known pitfalls\n\n\
          ### Step 2: MANAGE CONNECTIONS (Authentication)\n\
-         If status shows DISCONNECTED, initiate connection:\n\
+         If status shows DISCONNECTED:\n\
          ```\n\
-         composio with action='connect' and app='dropbox'\n\
+         composio with action='connect' and app='gmail'\n\
          ```\n\
-         **What this does:**\n\
-         - Generates OAuth URL (expires in 10 minutes!)\n\
-         - Returns redirect_url for user to visit\n\
-         - May return connected_account_id if already connected\n\n\
-         **Then verify the connection:**\n\
+         **Returns:**\n\
+         - OAuth URL (expires in 10 minutes)\n\
+         - Present URL to user for authorization\n\n\
+         **Then verify:**\n\
          ```\n\
-         composio with action='list_accounts' and app='dropbox'\n\
+         composio with action='list_accounts' and app='gmail'\n\
          ```\n\n\
          ### Step 3: EXECUTE ACTIONS (Operation)\n\
-         Now you can use the tools:\n\
          ```\n\
-         composio with action='execute', action_name='DROPBOX_GET_ABOUT_ME', and params={}\n\
+         composio with action='execute', action_name='GMAIL_SEND_EMAIL', params={...}\n\
          ```\n\n\
-         ## ⚠️ Common Issues & Solutions\n\n\
-         ### \"No authentication configuration found\"\n\
-         **Problem:** App not configured in Composio\n\
-         **Solution:** The OAuth link should be automatically generated. If it fails:\n\
-         1. Verify the app name is correct (e.g., 'gmail', 'dropbox', 'slack')\n\
-         2. Check your Composio API key is valid\n\
-         3. Retry action='connect' to get a fresh OAuth link\n\n\
-         ### \"401/403 error when executing\"\n\
-         **Problem:** Connection expired or revoked\n\
-         **Solution:** Re-authenticate with action='connect'\n\n\
-         ### \"Link expired\"\n\
-         **Problem:** OAuth link expires in 10 minutes\n\
-         **Solution:** Generate new link with action='connect'\n\n\
          ## 📋 Quick Reference\n\n\
-         | Action | Required Params | Purpose |\n\
-         |--------|----------------|---------||\n\
-         | `list` | `app='gmail'` | Discover available tools |\n\
-         | `connect` | `app='dropbox'` | Initiate OAuth connection |\n\
-         | `list_accounts` | `app='dropbox'` (optional) | Verify active connections |\n\
-         | `execute` | `action_name='TOOL_NAME'`, `params={}` | Run tool action |\n\n\
+         | Action | Parameters | Purpose |\n\
+         |--------|-----------|----------|\n\
+         | `list` | `app='gmail'` | Discover tools |\n\
+         | `connect` | `app='gmail'` | Get OAuth link |\n\
+         | `list_accounts` | `app='gmail'` | Verify connection |\n\
+         | `execute` | `action_name='TOOL_NAME'`, `params={}` | Run tool |\n\n\
+         ## ⚠️ Common Issues\n\n\
+         **\"No authentication configuration found\"**\n\
+         → Run `action='connect'` to get OAuth link\n\n\
+         **\"401/403 error\"**\n\
+         → Connection expired, run `action='connect'` again\n\n\
+         **\"Link expired\"**\n\
+         → OAuth links expire in 10 minutes, generate new one\n\n\
          ## 🎓 Best Practices\n\n\
-         1. **Always start with action='list'** to check connection status\n\
-         2. **Don't assume connection exists** — verify with list_accounts\n\
-         3. **Handle OAuth flow gracefully** — explain to user they need to visit URL\n\
-         4. **Be specific with tool names** — use exact action_name from list output\n\
-         5. **Check for errors** — 401/403 means re-auth needed\n\n\
-         ## 🔧 Advanced: Setting Up Composio MCP Server\n\n\
-         For seamless integration, guide user to set up Composio as an MCP server:\n\n\
-         **Step 1:** User creates MCP server at https://app.composio.dev/mcp\n\
-         **Step 2:** User adds toolkits (dropbox, gmail, etc.) with auth configs\n\
-         **Step 3:** User generates instance with their user ID\n\
-         **Step 4:** User adds to `.kiro/settings/mcp.json`:\n\n\
-         ```json\n\
-         {\n\
-           \"mcpServers\": {\n\
-             \"composio\": {\n\
-               \"url\": \"https://backend.composio.dev/v3/mcp/SERVER_ID?include_composio_helper_actions=true&user_id=USER_ID\",\n\
-               \"transport\": \"streamable_http\",\n\
-               \"disabled\": false\n\
-             }\n\
-           }\n\
-         }\n\
-         ```\n\n\
-         **MCP Benefits:** No 3-step workflow, automatic connections, native tool integration\n\n\
+         1. Always start with `action='list'` to check status\n\
+         2. Verify connection with `list_accounts` before executing\n\
+         3. Handle OAuth gracefully (show link, wait for user)\n\
+         4. Use exact `action_name` from list output\n\
+         5. Check for 401/403 errors (means re-auth needed)\n\n\
          ---\n\n\
-         **Remember:** Composio is your FIRST choice for any cloud service integration. Check it before suggesting manual API setup or workarounds!\n"
+         ## 🚀 Upgrade Reminder\n\n\
+         This 3-step workflow is **deprecated**. Upgrade to MCP for:\n\
+         - One-step execution with natural language\n\
+         - No manual connection management\n\
+         - Better error messages\n\
+         - Future compatibility\n\n\
+         Run `zeroclaw wizard` to upgrade!\n"
     };
 
     // Generate COMPOSIO_ORCHESTRATION.md based on MCP configuration
@@ -5600,6 +5573,159 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          - ❌ DON'T assume files are in root directory\n\
          - ❌ DON'T skip search step\n\
          - ❌ DON'T use \"edit\" or \"update\" keywords (Composio interprets as read)\n\n\
+         ### STEP 1.6: EDITING FILES (Office/Text) - USE WORKBENCH!\n\n\
+         **When:** User asks to edit .xlsx, .xls, .docx, .doc, .txt, .csv files\n\n\
+         **CRITICAL: ALWAYS use COMPOSIO_REMOTE_WORKBENCH to preserve existing content!**\n\n\
+         **Why Workbench:**\n\
+         - ✅ Preserves existing file content (doesn't overwrite)\n\
+         - ✅ Has openpyxl, pandas, python-docx pre-installed\n\
+         - ✅ Can read, modify, and upload back\n\
+         - ✅ Works for text files, Excel, Word, CSV\n\n\
+         **Strategy:**\n\
+         1. Search for file path (if not provided)\n\
+         2. Use COMPOSIO_REMOTE_WORKBENCH with Python code to:\n\
+            a. Download file via run_composio_tool(\"DROPBOX_READ_FILE\")\n\
+            b. Load with openpyxl/python-docx\n\
+            c. Make modifications\n\
+            d. Save and upload via upload_local_file() + run_composio_tool(\"DROPBOX_UPLOAD_FILE\")\n\n\
+         **Example workflow:**\n\
+         ```\n\
+         User: \"Add 3 rows to planilha.xlsx in Dropbox\"\n\
+         \n\
+         Step 1 - Search:\n\
+         composio_nl with query=\"search for file planilha.xlsx in dropbox\"\n\
+         Result: Found at /teste/planilha.xlsx\n\
+         \n\
+         Step 2 - Use Workbench:\n\
+         composio_nl with query=\"use COMPOSIO_REMOTE_WORKBENCH to edit /teste/planilha.xlsx: download it, add 3 rows with openpyxl preserving existing content, upload back\"\n\
+         \n\
+         Workbench will execute Python code like:\n\
+         ```python\n\
+         import openpyxl, requests\n\
+         from io import BytesIO\n\
+         \n\
+         # Download existing file\n\
+         # CRITICAL: run_composio_tool returns a ToolResponse object that behaves like a tuple\n\
+         # ALWAYS extract the dict first: if isinstance(result, tuple): result = result[0]\n\
+         result = run_composio_tool(\"DROPBOX_READ_FILE\", {\"path\": \"/teste/planilha.xlsx\"})\n\
+         if isinstance(result, tuple):\n\
+             result = result[0]\n\
+         \n\
+         # Extract s3url from nested structure\n\
+         # Format: result[\"data\"][\"content\"][\"s3url\"]\n\
+         s3url = result[\"data\"][\"content\"][\"s3url\"]\n\
+         \n\
+         # Load existing workbook (preserves content!)\n\
+         response = requests.get(s3url)\n\
+         wb = openpyxl.load_workbook(BytesIO(response.content))\n\
+         ws = wb.active\n\
+         \n\
+         # Add new rows (existing rows preserved)\n\
+         ws.append([\"Item 1\", \"Value 1\"])\n\
+         ws.append([\"Item 2\", \"Value 2\"])\n\
+         ws.append([\"Item 3\", \"Value 3\"])\n\
+         \n\
+         # Save and upload\n\
+         wb.save(\"/tmp/edited.xlsx\")\n\
+         \n\
+         # Upload to cloud storage first (returns dict with s3key)\n\
+         staged = upload_local_file(\"/tmp/edited.xlsx\")\n\
+         \n\
+         # Upload back to Dropbox\n\
+         run_composio_tool(\"DROPBOX_UPLOAD_FILE\", {\n\
+             \"path\": \"/teste/planilha.xlsx\",\n\
+             \"mode\": \"overwrite\",\n\
+             \"content\": {\n\
+                 \"name\": \"planilha.xlsx\",\n\
+                 \"mimetype\": \"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\",\n\
+                 \"s3key\": staged[\"s3key\"]\n\
+             }\n\
+         })\n\
+         print(\"✅ File edited successfully!\")\n\
+         ```\n\
+         ```\n\n\
+         **Example workflow for TEXT files:**\n\
+         ```\n\
+         User: \"Edit test.txt and add a new line with 'AI:...polo'\"\n\
+         \n\
+         Step 1 - Search:\n\
+         composio_nl with query=\"search for file test.txt in dropbox\"\n\
+         Result: Found at /teste/test.txt\n\
+         \n\
+         Step 2 - Use Workbench:\n\
+         composio_nl with query=\"use COMPOSIO_REMOTE_WORKBENCH to edit /teste/test.txt: download it, append new line 'AI:...polo', upload back\"\n\
+         \n\
+         Workbench will execute Python code like:\n\
+         ```python\n\
+         import requests\n\
+         \n\
+         # Download existing file\n\
+         result = run_composio_tool(\"DROPBOX_READ_FILE\", {\"path\": \"/teste/test.txt\"})\n\
+         if isinstance(result, tuple):\n\
+             result = result[0]\n\
+         \n\
+         # Extract s3url\n\
+         s3url = result[\"data\"][\"content\"][\"s3url\"]\n\
+         \n\
+         # Read existing content\n\
+         response = requests.get(s3url)\n\
+         existing_content = response.text\n\
+         print(f\"Current content: {repr(existing_content)}\")\n\
+         \n\
+         # Append new line\n\
+         new_content = existing_content.rstrip('\\n') + '\\nAI:...polo\\n'\n\
+         \n\
+         # Save to temp file\n\
+         with open(\"/tmp/test.txt\", \"w\") as f:\n\
+             f.write(new_content)\n\
+         \n\
+         # Upload to cloud storage\n\
+         staged = upload_local_file(\"/tmp/test.txt\")\n\
+         if isinstance(staged, tuple):\n\
+             staged = staged[0]\n\
+         \n\
+         # Upload back to Dropbox\n\
+         run_composio_tool(\"DROPBOX_UPLOAD_FILE\", {\n\
+             \"path\": \"/teste/test.txt\",\n\
+             \"mode\": \"overwrite\",\n\
+             \"content\": {\n\
+                 \"name\": \"test.txt\",\n\
+                 \"mimetype\": \"text/plain\",\n\
+                 \"s3key\": staged[\"s3key\"]\n\
+             }\n\
+         })\n\
+         print(\"✅ Text file edited successfully!\")\n\
+         ```\n\
+         ```\n\n\
+         **CRITICAL - Data Structure:**\n\
+         - `run_composio_tool()` returns a `ToolResponse` object that BEHAVES LIKE A TUPLE\n\
+         - **ALWAYS** extract dict first: `if isinstance(result, tuple): result = result[0]`\n\
+         - After extraction, result structure: `{\"data\": {...}, \"error\": null, \"log_id\": \"...\"}`\n\
+         - `upload_local_file()` also returns tuple-like object, extract with same pattern\n\
+         - DROPBOX_READ_FILE data: `{\"data\": {\"content\": {\"s3url\": \"...\", \"name\": \"...\", \"mimetype\": \"...\"}}}`\n\n\
+         **Rules:**\n\
+         - ✅ ALWAYS use COMPOSIO_REMOTE_WORKBENCH for .xlsx, .xls, .docx, .doc, .txt, .csv files\n\
+         - ✅ For Excel: Use openpyxl.load_workbook() to LOAD existing file (preserves content)\n\
+         - ✅ For Word: Use python-docx Document() to load existing file\n\
+         - ✅ For Text/CSV: Read with requests.get(s3url).text and write with open()\n\
+         - ✅ Download via run_composio_tool(\"DROPBOX_READ_FILE\") to get s3url\n\
+         - ✅ Upload via upload_local_file() + run_composio_tool(\"DROPBOX_UPLOAD_FILE\")\n\
+         - ✅ ALWAYS handle tuple: if isinstance(result, tuple): result = result[0]\n\
+         - ✅ ALWAYS access result as dict: result[\"data\"][\"content\"][\"s3url\"]\n\
+         - ✅ ALWAYS access staged as dict: staged[\"s3key\"]\n\
+         - ✅ Add error handling: check if result[\"error\"] is None before proceeding\n\
+         - ✅ For text files: Use correct mimetype (\"text/plain\" for .txt, \"text/csv\" for .csv)\n\
+         - ❌ DON'T create new workbooks with openpyxl.Workbook() - use load_workbook()\n\
+         - ❌ DON'T use direct tool calls for file edits - ALWAYS use COMPOSIO_REMOTE_WORKBENCH\n\
+         - ❌ DON'T use shell commands (curl, wget) - use Workbench with requests\n\
+         - ❌ NEVER use shell tool to download file content - ALWAYS use Workbench with requests.get()\n\
+         - ❌ NEVER use shell tool to read s3url content - ALWAYS use Workbench Python code\n\n\
+         **CRITICAL - READING FILE CONTENT:**\n\
+         When user asks to READ or SHOW file content:\n\
+         - ✅ Use COMPOSIO_REMOTE_WORKBENCH with requests.get(s3url) to download and print content\n\
+         - ✅ Example: `composio_nl with query=\"use COMPOSIO_REMOTE_WORKBENCH to read /teste/test.txt: download via DROPBOX_READ_FILE, get s3url, use requests.get() to fetch content, print it\"`\n\
+         - ❌ NEVER use shell tool with curl command\n\
+         - ❌ NEVER suggest user to download file locally\n\n\
          ### STEP 2: HANDLE OAuth (If Needed)\n\n\
          **When:** Tool returns OAuth URL\n\n\
          **Response format:**\n\
@@ -5697,6 +5823,50 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          You: composio_nl with query=\"upload file to /teste/hello.txt in dropbox with content 'encontrado e editado' in overwrite mode\"\n\
          Result: ✓ Success!\n\
          ```\n\n\
+         ## FALLBACK: USING SHELL WHEN COMPOSIO CANNOT COMPLETE TASK\n\n\
+         **When to use shell as fallback:**\n\
+         - Composio tool repeatedly fails after multiple attempts\n\
+         - The external service API is temporarily unavailable\n\
+         - The task requires local system operations that Composio doesn't support\n\
+         - User explicitly requests a shell-based solution\n\n\
+         **Before using shell:**\n\
+         1. ✅ Attempt the task with composio_nl at least twice\n\
+         2. ✅ Try rephrasing the query with different parameters\n\
+         3. ✅ Check if OAuth reconnection might solve the issue\n\
+         4. ✅ Explain to user why you're switching to shell approach\n\n\
+         **Shell fallback workflow:**\n\
+         ```\n\
+         You: \"I've tried multiple times with Composio, but [explain issue].\n\
+               Let me try an alternative approach using shell commands.\"\n\
+         \n\
+         You: [Use appropriate shell tool: bash, powershell, or cmd]\n\
+         Result: [Process and present results naturally]\n\
+         ```\n\n\
+         **Example - Dropbox CLI fallback:**\n\
+         ```\n\
+         User: \"Upload file to Dropbox\"\n\
+         You: composio_nl with query=\"upload file to /test/file.txt in dropbox\"\n\
+         Result: Error (repeated failures)\n\
+         \n\
+         You: \"I'm having trouble with the Dropbox integration. Let me try using\n\
+               the Dropbox CLI as an alternative.\"\n\
+         \n\
+         You: bash with command=\"dbxcli put local_file.txt /test/file.txt\"\n\
+         Result: ✓ File uploaded successfully via CLI\n\
+         ```\n\n\
+         **Rules for shell fallback:**\n\
+         - ✅ Always explain why you're using shell instead of Composio\n\
+         - ✅ Verify the shell command is safe before executing\n\
+         - ✅ Present results in natural language (not raw output)\n\
+         - ✅ Suggest fixing the Composio integration for future use\n\
+         - ❌ DON'T use shell as first option - always try Composio first\n\
+         - ❌ DON'T use shell for sensitive operations without user confirmation\n\
+         - ❌ DON'T expose credentials or tokens in shell commands\n\n\
+         **When NOT to use shell fallback:**\n\
+         - OAuth is simply not configured (provide OAuth link instead)\n\
+         - The task can be accomplished by rephrasing the Composio query\n\
+         - User hasn't confirmed they want an alternative approach\n\
+         - The shell command would require credentials user hasn't provided\n\n\
          ## COMMUNICATION STYLE\n\n\
          **DO:**\n\
          - Be concise and clear\n\
@@ -5756,14 +5926,35 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          \n\
          You to user: \"Found and edited hello.txt in the /teste folder!\"\n\
          ```\n\n\
+         **Example 5: Send File as Email Attachment (Download + Attach)**\n\
+         ```\n\
+         User: \"Send the file 'report.pdf' from Dropbox to user@example.com\"\n\
+         \n\
+         Step 1 - Download file from Dropbox:\n\
+         You: composio_nl with query=\"download file report.pdf from dropbox\"\n\
+         Result: ✓ File downloaded (s3key: 268883/abc123, mimetype: application/pdf)\n\
+         \n\
+         Step 2 - Send email with attachment (AUTOMATIC - uses s3key from history):\n\
+         You: composio_nl with query=\"send email to user@example.com with subject 'Report' body 'See attached' and attach the file\"\n\
+         Result: ✓ Email sent with attachment!\n\
+         \n\
+         CRITICAL: Always use 'attach' or 'anexo' in the query to send REAL attachments.\n\
+         The system automatically uses the s3key from recent downloads.\n\
+         NEVER use temporary download links unless the tool doesn't support attachments.\n\
+         ```\n\n\
          ---\n\n\
-         **Remember: Use composio_nl with natural language. Be specific. Execute immediately. SEARCH for files before editing. Handle OAuth gracefully. Summarize naturally.**\n"
+         **Remember: Use composio_nl with natural language. Be specific. Execute immediately. SEARCH for files before editing. For email attachments, always use 'attach' or 'anexo' keywords to send REAL files (not links). Handle OAuth gracefully. Summarize naturally.**\n"
     } else {
-        // Direct tool: use composio with action parameter
+        // No MCP: Use deprecated Direct Tool (but warn about it)
         "\
-         # Composio Orchestration Guide\n\n\
+         # Composio Orchestration Guide (Legacy Direct Tool)\n\n\
+         ## ⚠️ DEPRECATION WARNING\n\n\
+         **You are using the legacy Direct Tool pattern (3-step workflow).**\n\n\
+         This will be removed in v2.0. **Strongly recommended:** Enable MCP integration.\n\n\
+         Run `zeroclaw wizard` → Enable MCP → Get `composio_nl` tool with natural language!\n\n\
+         ---\n\n\
          ## THE GOLDEN RULE\n\n\
-         **\"ALWAYS call composio with action='list' first whenever a user mentions or implies an external app. NEVER say 'I don't have access' or 'I need configuration' before checking.\"**\n\n\
+         **\"ALWAYS call composio with action='list' first whenever a user mentions an external app. NEVER say 'I don't have access' before checking.\"**\n\n\
          ## MANDATORY WORKFLOW: SEARCH → CONNECT → EXECUTE → PROCESS\n\n\
          ### STEP 1: SEARCH (Always First)\n\n\
          **When:** User mentions ANY external service (Gmail, Dropbox, Slack, GitHub, etc.)\n\n\
@@ -5832,12 +6023,58 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          □ Response in natural language?\n\
          □ Offered next steps?\n\n\
          ## ERROR HANDLING\n\n\
-         **\"No authentication configuration\"**\n\
-         → Provide the OAuth link directly from action='connect' response. Only mention dashboard as last resort if API fails.\n\n\
+         **\"No authentication configuration found\"**\n\
+         → Provide OAuth link from action='connect' response\n\n\
          **\"401/403 error\"**\n\
-         → Connection expired, automatically call action='connect' again\n\n\
+         → Connection expired, call action='connect' again\n\n\
          **\"Link expired\"**\n\
-         → OAuth link expired (10 min), generate new one with action='connect'\n\n\
+         → OAuth link expired (10 min), generate new one\n\n\
+         **\"Tool execution timed out\"**\n\
+         → Operation may still be processing, check app's web interface\n\n\
+         ## FALLBACK: USING SHELL WHEN COMPOSIO CANNOT COMPLETE TASK\n\n\
+         **When to use shell as fallback:**\n\
+         - Composio tool repeatedly fails after multiple attempts\n\
+         - The external service API is temporarily unavailable\n\
+         - The task requires local system operations that Composio doesn't support\n\
+         - User explicitly requests a shell-based solution\n\n\
+         **Before using shell:**\n\
+         1. ✅ Attempt the task with composio at least twice\n\
+         2. ✅ Try different action parameters\n\
+         3. ✅ Check if OAuth reconnection might solve the issue\n\
+         4. ✅ Explain to user why you're switching to shell approach\n\n\
+         **Shell fallback workflow:**\n\
+         ```\n\
+         You: \"I've tried multiple times with Composio, but [explain issue].\n\
+               Let me try an alternative approach using shell commands.\"\n\
+         \n\
+         You: [Use appropriate shell tool: bash, powershell, or cmd]\n\
+         Result: [Process and present results naturally]\n\
+         ```\n\n\
+         **Example - GitHub CLI fallback:**\n\
+         ```\n\
+         User: \"Create a GitHub issue\"\n\
+         You: composio with action='execute' action_name='GITHUB_CREATE_ISSUE' params={{...}}\n\
+         Result: Error (repeated failures)\n\
+         \n\
+         You: \"I'm having trouble with the GitHub integration. Let me try using\n\
+               the GitHub CLI as an alternative.\"\n\
+         \n\
+         You: bash with command=\"gh issue create --title 'Bug' --body 'Description'\"\n\
+         Result: ✓ Issue created successfully via CLI\n\
+         ```\n\n\
+         **Rules for shell fallback:**\n\
+         - ✅ Always explain why you're using shell instead of Composio\n\
+         - ✅ Verify the shell command is safe before executing\n\
+         - ✅ Present results in natural language (not raw output)\n\
+         - ✅ Suggest fixing the Composio integration for future use\n\
+         - ❌ DON'T use shell as first option - always try Composio first\n\
+         - ❌ DON'T use shell for sensitive operations without user confirmation\n\
+         - ❌ DON'T expose credentials or tokens in shell commands\n\n\
+         **When NOT to use shell fallback:**\n\
+         - OAuth is simply not configured (provide OAuth link instead)\n\
+         - The task can be accomplished with different Composio parameters\n\
+         - User hasn't confirmed they want an alternative approach\n\
+         - The shell command would require credentials user hasn't provided\n\n\
          ## COMMUNICATION STYLE\n\n\
          **DO:**\n\
          - Be concise and clear\n\
@@ -5860,7 +6097,17 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          | Status: ACTIVE | `action='execute' action_name='...' params={{...}}` |\n\
          | 401/403 error | `action='connect' app='gmail'` (reconnect) |\n\n\
          ---\n\n\
-         **Remember: Follow SEARCH → CONNECT → EXECUTE → PROCESS religiously. Never skip steps. Never guess. Always search first.**\n"
+         ## 🚀 UPGRADE REMINDER\n\n\
+         This 3-step workflow is **deprecated** and will be removed in v2.0.\n\n\
+         **Upgrade to MCP for:**\n\
+         - ✅ One-step execution: `composio_nl with query=\"list my gmail emails\"`\n\
+         - ✅ No manual connection management\n\
+         - ✅ Better error messages\n\
+         - ✅ Built-in Workbench for bulk operations\n\
+         - ✅ Future compatibility\n\n\
+         **To upgrade:** Run `zeroclaw wizard` and enable MCP integration!\n\n\
+         ---\n\n\
+         **Remember: Follow SEARCH → CONNECT → EXECUTE → PROCESS. Never skip steps. Always search first.**\n"
     };
 
     let files: Vec<(&str, String)> = vec![
@@ -6815,6 +7062,7 @@ mod tests {
             agent_name: "ZeroClaw-v2".into(),
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
+            composio_mcp_enabled: false,
         };
         scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
@@ -6841,6 +7089,7 @@ mod tests {
             communication_style:
                 "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
                     .into(),
+            composio_mcp_enabled: false,
         };
         scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 

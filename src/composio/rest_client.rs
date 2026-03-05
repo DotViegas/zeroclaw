@@ -2,27 +2,255 @@
 //
 // This client is used by both ComposioTool and onboarding flows to avoid
 // circular dependencies and code duplication.
+//
+// Enhanced for Composio Permanent Integration:
+// - Direct tool execution via REST API v3
+// - Connection pooling (8 idle connections per host)
+// - Timeout configuration (180s execution, 30s metadata)
+// - Proper error handling with structured error types
 
 use anyhow::Context;
 use reqwest::Client;
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::time::Duration;
 
 const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api/v2";
 const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
 const COMPOSIO_TOOL_VERSION_LATEST: &str = "latest";
 
+// Timeout constants
+const EXECUTION_TIMEOUT_SECS: u64 = 180; // 3 minutes for tool execution
+const METADATA_TIMEOUT_SECS: u64 = 30;   // 30 seconds for metadata operations
+
 /// Shared REST client for Composio API (v2/v3)
+///
+/// Supports both OAuth connection management and direct tool execution.
+/// Uses connection pooling and proper timeouts for optimal performance.
 pub struct ComposioRestClient {
     api_key: String,
+    user_id: String,
     client: Client,
+    execution_client: Client, // Separate client with longer timeout for tool execution
 }
 
 impl ComposioRestClient {
-    /// Create a new Composio REST client
-    pub fn new(api_key: String) -> Self {
-        let client = crate::config::build_runtime_proxy_client_with_timeouts("tool.composio", 60, 10);
-        Self { api_key, client }
+    /// Create a new Composio REST client with connection pooling and timeouts
+    ///
+    /// # Arguments
+    /// * `api_key` - Composio API key
+    /// * `user_id` - User ID for v3 session-based architecture
+    ///
+    /// # Connection Pooling
+    /// - 8 idle connections per host for optimal performance
+    /// - Automatic connection reuse across requests
+    ///
+    /// # Timeouts
+    /// - Metadata operations: 30 seconds
+    /// - Tool execution: 180 seconds
+    pub fn new(api_key: String, user_id: String) -> Self {
+        // Metadata client with 30s timeout
+        let client = Client::builder()
+            .pool_max_idle_per_host(8)
+            .timeout(Duration::from_secs(METADATA_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
+        // Execution client with 180s timeout
+        let execution_client = Client::builder()
+            .pool_max_idle_per_host(8)
+            .timeout(Duration::from_secs(EXECUTION_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
+        Self {
+            api_key,
+            user_id,
+            client,
+            execution_client,
+        }
+    }
+
+    /// Get the user ID for this client
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    /// Execute a tool directly via REST API v3
+    ///
+    /// # Arguments
+    /// * `tool_name` - Name of the tool to execute (e.g., "GMAIL_SEND_EMAIL")
+    /// * `params` - Tool parameters as JSON value
+    ///
+    /// # Returns
+    /// Tool execution result with success status and output
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Tool not found
+    /// - Authentication required (OAuth not connected)
+    /// - Invalid parameters
+    /// - Network error
+    /// - Execution timeout (180s)
+    pub async fn execute_tool(
+        &self,
+        tool_name: &str,
+        params: Value,
+    ) -> anyhow::Result<ToolExecutionResult> {
+        let url = format!("{COMPOSIO_API_BASE_V3}/actions/{}/execute", tool_name);
+
+        let body = json!({
+            "input": params,
+            "userId": self.user_id,
+        });
+
+        tracing::debug!(
+            tool = tool_name,
+            user_id = %self.user_id,
+            "Executing tool via REST API v3"
+        );
+
+        let resp = self
+            .execution_client
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to send tool execution request")?;
+
+        let status = resp.status();
+        tracing::debug!(
+            tool = tool_name,
+            status = %status,
+            "Received tool execution response"
+        );
+
+        if !status.is_success() {
+            let err = response_error(resp).await;
+            
+            // Check for authentication errors
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return Err(anyhow::anyhow!(
+                    "Authentication required for tool '{}': {}. Please connect your account.",
+                    tool_name,
+                    err
+                ));
+            }
+            
+            return Err(anyhow::anyhow!(
+                "Tool execution failed for '{}': {}",
+                tool_name,
+                err
+            ));
+        }
+
+        let result: ToolExecutionResult = resp
+            .json()
+            .await
+            .context("Failed to decode tool execution response")?;
+
+        tracing::info!(
+            tool = tool_name,
+            success = result.success,
+            "Tool execution completed"
+        );
+
+        Ok(result)
+    }
+
+    /// List available tools for the user
+    ///
+    /// # Arguments
+    /// * `toolkit` - Optional toolkit filter (e.g., "gmail", "slack")
+    ///
+    /// # Returns
+    /// List of available tools with their schemas
+    pub async fn list_tools(&self, toolkit: Option<&str>) -> anyhow::Result<Vec<ToolInfo>> {
+        let url = format!("{COMPOSIO_API_BASE_V3}/actions");
+        
+        let mut req = self
+            .client
+            .get(&url)
+            .header("x-api-key", &self.api_key)
+            .query(&[("userId", &self.user_id)]);
+
+        if let Some(tk) = toolkit {
+            req = req.query(&[("apps", tk)]);
+        }
+
+        tracing::debug!(
+            toolkit = ?toolkit,
+            user_id = %self.user_id,
+            "Listing tools via REST API v3"
+        );
+
+        let resp = req
+            .send()
+            .await
+            .context("Failed to send list tools request")?;
+
+        if !resp.status().is_success() {
+            let err = response_error(resp).await;
+            return Err(anyhow::anyhow!("Failed to list tools: {}", err));
+        }
+
+        let body: ToolsListResponse = resp
+            .json()
+            .await
+            .context("Failed to decode tools list response")?;
+
+        tracing::info!(
+            count = body.items.len(),
+            "Retrieved tools list"
+        );
+
+        Ok(body.items)
+    }
+
+    /// Get detailed schema for a specific tool
+    ///
+    /// # Arguments
+    /// * `tool_name` - Name of the tool
+    ///
+    /// # Returns
+    /// Tool schema with parameters and description
+    pub async fn get_tool_schema(&self, tool_name: &str) -> anyhow::Result<ToolInfo> {
+        let url = format!("{COMPOSIO_API_BASE_V3}/actions/{}", tool_name);
+
+        tracing::debug!(
+            tool = tool_name,
+            "Fetching tool schema via REST API v3"
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("x-api-key", &self.api_key)
+            .send()
+            .await
+            .context("Failed to send get tool schema request")?;
+
+        if !resp.status().is_success() {
+            let err = response_error(resp).await;
+            return Err(anyhow::anyhow!(
+                "Failed to get tool schema for '{}': {}",
+                tool_name,
+                err
+            ));
+        }
+
+        let tool: ToolInfo = resp
+            .json()
+            .await
+            .context("Failed to decode tool schema response")?;
+
+        tracing::debug!(
+            tool = tool_name,
+            "Retrieved tool schema"
+        );
+
+        Ok(tool)
     }
 
     /// Get the OAuth connection URL for a specific app/toolkit or auth config
@@ -387,6 +615,77 @@ fn extract_api_error_message(body: &str) -> Option<String> {
 
 // ── API response types ──────────────────────────────────────────
 
+/// Tool execution result from REST API v3
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolExecutionResult {
+    /// Whether the execution was successful
+    #[serde(default)]
+    pub success: bool,
+    
+    /// Execution output data
+    #[serde(default)]
+    pub data: Option<Value>,
+    
+    /// Error message if execution failed
+    #[serde(default)]
+    pub error: Option<String>,
+    
+    /// Execution metadata
+    #[serde(default)]
+    pub metadata: Option<Value>,
+}
+
+impl ToolExecutionResult {
+    /// Convert to output string for display
+    pub fn to_output_string(&self) -> String {
+        if let Some(ref error) = self.error {
+            return error.clone();
+        }
+        
+        if let Some(ref data) = self.data {
+            return serde_json::to_string_pretty(data)
+                .unwrap_or_else(|_| format!("{:?}", data));
+        }
+        
+        "No output".to_string()
+    }
+    
+    /// Check if this is an error result
+    pub fn is_error(&self) -> bool {
+        !self.success || self.error.is_some()
+    }
+}
+
+/// Tool information from REST API v3
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInfo {
+    /// Tool name (e.g., "GMAIL_SEND_EMAIL")
+    pub name: String,
+    
+    /// Tool description
+    #[serde(default)]
+    pub description: Option<String>,
+    
+    /// Tool parameters schema (JSON Schema)
+    #[serde(default)]
+    pub parameters: Option<Value>,
+    
+    /// Toolkit/app name (e.g., "gmail")
+    #[serde(default)]
+    pub app_name: Option<String>,
+    
+    /// Whether authentication is required
+    #[serde(default)]
+    pub requires_auth: bool,
+}
+
+/// Response from tools list endpoint
+#[derive(Debug, Deserialize)]
+struct ToolsListResponse {
+    #[serde(default)]
+    items: Vec<ToolInfo>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ComposioConnectedAccountsResponse {
     #[serde(default)]
@@ -532,5 +831,82 @@ mod tests {
 
         assert!(enabled.is_enabled());
         assert!(!disabled.is_enabled());
+    }
+
+    #[test]
+    fn rest_client_stores_user_id() {
+        let client = ComposioRestClient::new(
+            "test_api_key".to_string(),
+            "test_user".to_string(),
+        );
+        assert_eq!(client.user_id(), "test_user");
+    }
+
+    #[test]
+    fn tool_execution_result_to_output_string_returns_error_first() {
+        let result = ToolExecutionResult {
+            success: false,
+            data: Some(json!({"result": "data"})),
+            error: Some("Error occurred".to_string()),
+            metadata: None,
+        };
+        assert_eq!(result.to_output_string(), "Error occurred");
+    }
+
+    #[test]
+    fn tool_execution_result_to_output_string_returns_data_when_no_error() {
+        let result = ToolExecutionResult {
+            success: true,
+            data: Some(json!({"result": "success"})),
+            error: None,
+            metadata: None,
+        };
+        let output = result.to_output_string();
+        assert!(output.contains("result"));
+        assert!(output.contains("success"));
+    }
+
+    #[test]
+    fn tool_execution_result_to_output_string_returns_no_output_when_empty() {
+        let result = ToolExecutionResult {
+            success: true,
+            data: None,
+            error: None,
+            metadata: None,
+        };
+        assert_eq!(result.to_output_string(), "No output");
+    }
+
+    #[test]
+    fn tool_execution_result_is_error_when_success_false() {
+        let result = ToolExecutionResult {
+            success: false,
+            data: None,
+            error: None,
+            metadata: None,
+        };
+        assert!(result.is_error());
+    }
+
+    #[test]
+    fn tool_execution_result_is_error_when_error_present() {
+        let result = ToolExecutionResult {
+            success: true,
+            data: None,
+            error: Some("Error".to_string()),
+            metadata: None,
+        };
+        assert!(result.is_error());
+    }
+
+    #[test]
+    fn tool_execution_result_is_not_error_when_successful() {
+        let result = ToolExecutionResult {
+            success: true,
+            data: Some(json!({"result": "ok"})),
+            error: None,
+            metadata: None,
+        };
+        assert!(!result.is_error());
     }
 }

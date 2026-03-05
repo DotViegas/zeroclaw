@@ -59,6 +59,27 @@ struct SchemaCacheEntry {
 }
 
 /// Composio Meta-Tool - wraps Pattern 2 discovery and execution
+///
+/// # Deprecation Notice
+///
+/// This implementation is deprecated in favor of `ComposioNaturalLanguageTool` which provides
+/// a more unified and stable interface for MCP Pattern 2 with all 5 meta tools.
+///
+/// **Migration Guide:** See `docs/composio-migration.md` for step-by-step instructions on
+/// migrating to the new `ComposioNaturalLanguageTool`.
+///
+/// **Why deprecated:**
+/// - ComposioMetaTool was an intermediate implementation during MCP integration
+/// - ComposioNaturalLanguageTool consolidates all meta tool handlers into a single, stable interface
+/// - Better Workbench integration with session persistence and output summarization
+/// - Improved parameter extraction with 3-layer strategy (quick/LLM/generic)
+/// - Enhanced caching and connection management
+///
+/// **Timeline:** This implementation will be removed in a future major version.
+#[deprecated(
+    since = "0.1.0",
+    note = "Use ComposioNaturalLanguageTool for unified MCP Pattern 2 interface. See docs/composio-migration.md for migration guide."
+)]
 pub struct ComposioMetaTool {
     mcp_client: Arc<ComposioMcpClient>,
     rest_client: Arc<ComposioRestClient>,
@@ -86,6 +107,16 @@ impl ComposioMetaTool {
         security: Arc<SecurityPolicy>,
         onboarding: Option<Arc<dyn ComposioOnboarding>>,
     ) -> Self {
+        // Emit deprecation warning
+        tracing::warn!(
+            target: "zeroclaw::tools::composio",
+            component = "ComposioMetaTool",
+            event = "deprecation_warning",
+            message = "ComposioMetaTool is deprecated. Use ComposioNaturalLanguageTool for unified MCP Pattern 2 interface.",
+            migration_guide = "https://github.com/zeroclaw/zeroclaw/blob/main/docs/composio-migration.md",
+            "ComposioMetaTool instantiated - this implementation is deprecated and will be removed in a future version"
+        );
+        
         Self {
             mcp_client,
             rest_client,

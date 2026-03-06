@@ -1,0 +1,46 @@
+[package]
+name = "composio-sdk"
+version = "0.1.1"
+edition = "2021"
+authors = ["DotViegas <https://github.com/DotViegas>"]
+description = "Minimal Rust SDK for Composio Tool Router REST API"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DotViegas/composio-sdk-rust"
+documentation = "https://docs.rs/composio-sdk"
+homepage = "https://github.com/DotViegas/composio-sdk-rust"
+keywords = ["composio", "api", "sdk", "tool-router", "ai"]
+categories = ["api-bindings", "web-programming::http-client"]
+exclude = [
+    "CLEANUP_REPORT.md",
+    ".git/",
+]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+local-debug = ["tracing", "tracing-subscriber"]
+
+[dependencies]
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+tokio = { version = "1.0", features = ["full"] }
+tokio-retry = "0.3"
+thiserror = "1.0"
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+
+[dev-dependencies]
+wiremock = "0.5"
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3.8"
+
+[[bench]]
+name = "sdk_benchmarks"
+harness = false
